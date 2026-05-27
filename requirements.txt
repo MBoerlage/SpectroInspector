@@ -1,0 +1,4 @@
+astropy>=5.0
+numpy>=1.23
+matplotlib>=3.7
+PyQt6>=6.4

@@ -1,0 +1,118 @@
+Spectro Exposure Time Tool  v4
+================================
+Field FITS inspector for the StarEX 300 LR spectrograph + ZWO ASI 585MM Pro camera.
+Designed for use at the telescope with a red astronomy filter (night-vision palette).
+
+
+REQUIREMENTS
+------------
+  Python 3.11+
+  pip install astropy PyQt6 matplotlib
+
+
+HOW TO RUN
+----------
+  python spectro_tool.py
+
+
+QUICK START
+-----------
+1. Click "Select Folder" and point it at your FITS output directory.
+   The tool loads the most recent file immediately and watches for new ones.
+
+2. Drag the coloured handles on the image (or edit the spinboxes) to place the
+   TARGET and background (BG ABOVE / BG BELOW) extraction bands over your star trace.
+
+3. Read the Exposure Advisory panel on the right:
+   - Peak fill     — how full the brightest pixel is relative to the sat. threshold
+   - Peak SNR      — signal-to-noise at the brightest wavelength column
+   - Frames: SNR 100 — how many stacked exposures are needed to reach SNR 100
+   - Noise regime  — tells you whether longer exposures or more frames helps most
+   - Exp. suggestion — suggested exposure time to hit ~80% of the sat. threshold
+
+4. Enable "Gain Advice" for a full ASI585MM Pro gain analysis (HCG mode awareness).
+
+5. Use "⊕ Zoom Box" to draw a rectangle on the image and zoom in;
+   the spectrum X-axis synchronises automatically.
+   Click "↺ Reset View" to return to the full frame.
+
+6. Switch to the "Session Monitor" tab to track multi-frame session quality.
+
+
+SESSION MONITOR TAB
+-------------------
+The Session Monitor tracks quality metrics across all frames captured during a session.
+Set the "Flatness threshold" (ADU/column) to control which wavelength columns are
+considered flat continuum (free of strong spectral lines). Default 500 ADU/col.
+
+▶ Spatial FWHM Monitor (click to expand)
+   Tracks the stellar trace width (seeing) per frame using a Gaussian fit to the
+   spatial profile of continuum columns. Baseline is set from the first reliable fits.
+   - Warn%  — how far above baseline triggers an orange warning
+   - Alarm% — how far above baseline triggers a red alarm
+
+▶ Signal Convergence Monitor
+   Tracks how stacked SNR grows with each included frame.
+   - Top chart: running mean spectrum with a ±Nσ confidence envelope.
+     Coloured ticks below the x-axis mark columns where a spectral feature
+     persists above the Persistence threshold across frames.
+   - Bottom sparkline: continuum SNR vs. frame number. Dashed line = ideal √N growth.
+     Three or more consecutive frames deviating significantly trigger a warning
+     (possible transparency or guiding event).
+
+▶ Frame Manager (click to expand)
+   Shows every frame with its peak ADU, continuum SNR, FWHM, and inclusion status.
+   Auto-flag rules: Low SNR, High FWHM, Saturated, < 10 continuum columns.
+   - Uncheck "Include" to exclude a frame from session statistics.
+   - Click "Recompute All" to replay Welford stats after exclusion changes.
+   - In "Keep Current" display mode, clicking a row shows that frame in the image canvas.
+
+
+LOGBOOK
+-------
+A notepad text area in the lower-left panel. When a FITS file with an OBJECT header
+keyword is loaded, the logbook automatically opens (or creates) a file named
+logbook_<TargetName>.txt in the watch folder. The first line of a new logbook contains
+the creation timestamp and target name.
+Notes are auto-saved 5 seconds after each keystroke, and flushed on application close.
+
+
+CAMERA NOTES — ZWO ASI 585MM Pro
+----------------------------------
+The camera has a 12-bit native ADC but writes 16-bit FITS files.
+Raw pixel values in FITS = 12-bit ADC output × 16.
+
+Conversion gain used for SNR maths (e⁻ per 16-bit FITS ADU):
+  Gain  0  →  0.594 e⁻/ADU    Gain 200 (HCG) →  0.047 e⁻/ADU
+  Gain 50  →  0.344            Gain 250       →  0.022
+  Gain 100 →  0.188            Gain 300       →  0.011
+  Gain 150 →  0.113            Gain 350       →  0.006
+  Gain 195 →  0.063            Gain 400       →  0.003
+                                Gain 450       →  0.001
+
+HCG mode activates at gain slider ≥ 200.  At gain 200, read noise drops from
+~4 e⁻ (normal mode) to ~1 e⁻ — a 4× improvement — at the cost of a smaller
+full well (~2 500 e⁻ vs ~4 000 e⁻ at gain 195).
+
+The gain and read-noise values are looked up automatically from the FITS GAIN
+header keyword and used in the SNR calculation.
+
+
+CONFIGURATION
+-------------
+Settings are saved automatically to spectro_config.json in the same folder.
+You can edit this file directly to adjust defaults (e.g. target_fill, poll_interval_ms).
+
+Key config fields:
+  saturation_threshold  — fraction of full ADU range treated as saturated (default 0.70)
+  target_fill           — desired fill fraction for exposure suggestions (default 0.80)
+  poll_interval_ms      — folder polling interval in milliseconds (default 2000)
+  flatness_threshold    — derivative threshold for continuum column detection (default 500)
+
+
+FILES
+-----
+  spectro_tool.py            — main application
+  spectro_config.json        — auto-generated settings file (created on first run)
+  logbook_<Target>.txt       — per-target session logbook (created in watch folder)
+  Description.txt            — this file

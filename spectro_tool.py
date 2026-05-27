@@ -792,8 +792,9 @@ class SessionData:
         self._spectra:    dict[int, np.ndarray]    = {}
         self._cont_masks: dict[int, np.ndarray]    = {}
         self._n_cols:     int                      = 0
-        self.welford:     WelfordStats | None      = None
-        self.persistence: np.ndarray | None        = None   # fraction per column
+        self.welford:          WelfordStats | None  = None
+        self.persistence:      np.ndarray | None   = None   # fraction [0,1] per column
+        self._persistence_raw: np.ndarray | None   = None   # raw exceedance counts
         self.snr_history: list[float]              = []     # cont. SNR per included frame
 
     # ── add a new frame ───────────────────────────────────────────────────────
@@ -808,10 +809,11 @@ class SessionData:
         if spec is not None:
             n = len(spec)
             if n != self._n_cols:
-                self._n_cols     = n
-                self.welford     = WelfordStats(n)
-                self.persistence = np.zeros(n)
-                self.snr_history = []
+                self._n_cols          = n
+                self.welford          = WelfordStats(n)
+                self.persistence      = np.zeros(n)
+                self._persistence_raw = np.zeros(n)
+                self.snr_history      = []
         if rec.inclusion != "excluded" and spec is not None:
             self._incremental(spec, cont_mask)
 
@@ -823,7 +825,9 @@ class SessionData:
         prev_std  = wf.std().copy()
         wf.update(spec)
         if wf.n >= 3 and self.persistence is not None:
-            self.persistence += (spec > prev_mean + 2.0 * prev_std).astype(float)
+            self._persistence_raw += (spec > prev_mean + 2.0 * prev_std).astype(float)
+            eligible = wf.n - 2   # frames that could have triggered (need prior mean+std)
+            self.persistence = self._persistence_raw / eligible
         # Session SNR = quadrature sum of per-frame photon SNR → grows as SNR_1·√N
         snrs = [r.continuum_snr for r in self.records
                 if r.inclusion != "excluded" and r.continuum_snr is not None]
@@ -851,9 +855,11 @@ class SessionData:
                     if r.continuum_snr is not None]
             if snrs:
                 snr_h.append(float(np.sqrt(sum(s * s for s in snrs))))
-        self.welford     = wf
-        self.persistence = persist / max(len(included), 1)
-        self.snr_history = snr_h
+        eligible = max(len(included) - 2, 1)   # frames that could have triggered
+        self.welford          = wf
+        self._persistence_raw = persist
+        self.persistence      = persist / eligible
+        self.snr_history      = snr_h
 
     # ── convenience properties ────────────────────────────────────────────────
     @property
@@ -1446,10 +1452,10 @@ class AdvisoryPanel(QWidget):
             return
 
         g_val = float(gs)
-        e_adu, rn_cam, fw_e = interp_gain(g_val)
+        _e_adu, rn_cam, fw_e = interp_gain(g_val)
         in_hcg = g_val >= HCG_THRESHOLD
 
-        bg_e_px = float(np.mean(np.maximum(bg_per_row, 0.0))) * e_adu
+        bg_e_px = float(np.mean(np.maximum(bg_per_row, 0.0))) * G
         if   bg_e_px > rn_cam ** 2: g_regime = "background-limited"
         elif rn_cam ** 2 > bg_e_px: g_regime = "read-noise limited"
         else:                        g_regime = "signal-limited"

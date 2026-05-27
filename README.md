@@ -1,8 +1,24 @@
 # Spectro Inspector
 
-Field FITS inspector for the **StarEX 300 LR** spectrograph + **ZWO ASI 585MM Pro** camera.
+With great help from Claude, I wrote an inspector app for spectroscopy data acquisition. This app polls you FITS science image folder for new images (any app can take the images such as Sharpcap or NINA) and then runs stats. Your images will remain unaltered (and uncalibrated).  
 
-Designed for use at the telescope with a red astronomy filter. The entire UI uses red-channel brightness only so it remains visible through a night-vision filter.
+Stats included in this release: Exposure Advisory; to help stay within the linear range of your CMOS sensor, FWHM on the width of the target (changing FWHM points to changing seeing or slit, guiding issues). There is a tab for Session stats - highlighting outlier subs, and showing how SNR improves towards your target SNR over time. 
+
+Can be used for any slit (StarEx) or slitless (SA100, SA200) spectroscope setup. 
+
+There is a night mode optimmized for using a red filter on your laptop screen. Day mode will be bright default color scheme. 
+
+
+## Screenshots
+
+| | |
+|---|---|
+| ![Saturation detection — day mode](screenshots/SaturationDetection.png) | ![Session monitor — day mode](screenshots/SaturationDetectionSession.png) |
+| **Saturation detection (day mode)** — Red shading highlights saturated columns on both the 2D image and the extracted spectrum. The advisory panel reports the first saturated column and suggests a shorter exposure. | **Session Monitor tab (day mode)** — FWHM trend chart, Signal Convergence with ±σ envelope, SNR-vs-frame sparkline, and Frame Manager table with auto-flagged frames. |
+| ![Session monitor — night mode](screenshots/SessionMonitor_NightMode.png) | ![Session monitor — night mode, M77](screenshots/SessionMonitor_NightMode_M77.png) |
+| **Session Monitor in night-vision palette** — The full red-channel-only UI for use at the telescope. Signal Convergence, SNR sparkline, and Frame Manager shown across 10 frames. | **Night mode — M77** — Convergence chart showing persistent spectral features (coloured ticks below x-axis), 5 stacked frames with √N SNR growth tracked in the sparkline. |
+
+
 
 ## Requirements
 
@@ -34,15 +50,6 @@ or double-click `run.bat`.
 ```
 python spectro_tool.py
 ```
-
-## Screenshots
-
-| | |
-|---|---|
-| ![Saturation detection — day mode](screenshots/SaturationDetection.png) | ![Session monitor — day mode](screenshots/SaturationDetectionSession.png) |
-| **Saturation detection (day mode)** — Red shading highlights saturated columns on both the 2D image and the extracted spectrum. The advisory panel reports the first saturated column and suggests a shorter exposure. | **Session Monitor tab (day mode)** — FWHM trend chart, Signal Convergence with ±σ envelope, SNR-vs-frame sparkline, and Frame Manager table with auto-flagged frames. |
-| ![Session monitor — night mode](screenshots/SessionMonitor_NightMode.png) | ![Session monitor — night mode, M77](screenshots/SessionMonitor_NightMode_M77.png) |
-| **Session Monitor in night-vision palette** — The full red-channel-only UI for use at the telescope. Signal Convergence, SNR sparkline, and Frame Manager shown across 10 frames. | **Night mode — M77** — Convergence chart showing persistent spectral features (coloured ticks below x-axis), 5 stacked frames with √N SNR growth tracked in the sparkline. |
 
 ## Quick Start
 

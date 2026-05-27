@@ -1,7 +1,26 @@
 @echo off
-echo Installing Spectro Exposure Time Tool dependencies...
+cd /d "%~dp0"
+echo Spectro Inspector — dependency installer
 echo.
-pip install astropy numpy matplotlib PyQt6
+
+where python >nul 2>&1
+if errorlevel 1 (
+    echo ERROR: Python not found. Install Python 3.11+ from https://python.org
+    pause
+    exit /b 1
+)
+
+echo Creating virtual environment (.venv)...
+python -m venv .venv
+if errorlevel 1 (
+    echo WARNING: Could not create virtual environment; installing into system Python.
+    pip install -r requirements.txt
+) else (
+    echo Activating virtual environment and installing dependencies...
+    call .venv\Scripts\activate.bat
+    pip install -r requirements.txt
+    echo.
+    echo Done. Run the tool with:  run.bat
+)
 echo.
-echo Done. Run the tool with:  python spectro_tool.py
 pause

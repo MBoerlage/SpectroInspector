@@ -492,8 +492,11 @@ def load_config() -> dict:
 
 
 def save_config(cfg: dict):
-    with open(CONFIG_FILE, "w") as f:
-        json.dump(cfg, f, indent=2)
+    try:
+        with open(CONFIG_FILE, "w") as f:
+            json.dump(cfg, f, indent=2)
+    except Exception as e:
+        print(f"Config save error: {e}")
 
 
 # ── FITS loading ───────────────────────────────────────────────────────────────
@@ -659,12 +662,13 @@ def compute_flatness_mask(spec: np.ndarray, central_fraction: float = 0.35,
         return mask
     sub = spec[c0:c1].astype(np.float64)
     hw = deriv_window // 2
-    deriv = np.empty(len(sub))
-    for i in range(len(sub)):
-        lo, hi = max(0, i - hw), min(len(sub), i + hw + 1)
-        x = np.arange(lo, hi, dtype=float) - i
-        y = sub[lo:hi]
-        deriv[i] = float(np.polyfit(x, y, 1)[0]) if (hi - lo) >= 2 else 0.0
+    # Savitzky-Golay first-derivative kernel: least-squares linear slope over the window.
+    # Equivalent to the per-element np.polyfit loop but vectorized via convolution.
+    kernel = np.arange(-hw, hw + 1, dtype=np.float64)
+    norm = float(np.dot(kernel, kernel))
+    if norm > 0:
+        kernel /= norm
+    deriv = np.convolve(sub, kernel[::-1], mode='same')
     mask[c0:c1] = np.abs(deriv) <= threshold
     return mask
 
@@ -910,14 +914,17 @@ class SessionData:
 
 
 # ── Line definitions for draggable handles ────────────────────────────────────
-_LINE_DEFS = [
-    ("bga_top", "BG▲ top",  BG_C,     "--"),
-    ("bga_bot", "BG▲ bot",  BG_C,     "--"),
-    ("tgt_top", "TGT top",  TARGET_C, "-"),
-    ("tgt_bot", "TGT bot",  TARGET_C, "-"),
-    ("bgb_top", "BG▼ top",  BG_C,     "--"),
-    ("bgb_bot", "BG▼ bot",  BG_C,     "--"),
-]
+# Returns fresh tuples so colors always reflect the active palette after a theme switch.
+def _line_defs() -> list:
+    return [
+        ("bga_top", "BG▲ top",  BG_C,     "--"),
+        ("bga_bot", "BG▲ bot",  BG_C,     "--"),
+        ("tgt_top", "TGT top",  TARGET_C, "-"),
+        ("tgt_bot", "TGT bot",  TARGET_C, "-"),
+        ("bgb_top", "BG▼ top",  BG_C,     "--"),
+        ("bgb_bot", "BG▼ bot",  BG_C,     "--"),
+    ]
+
 _CFG_KEYS = {
     "tgt_top": "target_y_start",   "tgt_bot": "target_y_end",
     "bga_top": "bg_above_y_start", "bga_bot": "bg_above_y_end",
@@ -1035,7 +1042,7 @@ class ImageCanvas(FigureCanvas):
         self.draw_idle()
 
     def _draw_lines(self, w, h):
-        for key, label, color, ls in _LINE_DEFS:
+        for key, label, color, ls in _line_defs():
             y = self._region[key]
             line, = self.ax.plot([0, w], [y, y], color=color, lw=1.3,
                                  ls=ls, alpha=0.9, zorder=8)
@@ -2162,7 +2169,7 @@ class FrameManagerPanel(QWidget):
     def _on_item_changed(self, item: QTableWidgetItem):
         if self._updating or self._session is None:
             return
-        if item.column() != 6:
+        if item.column() != self._COL_HEADERS.index("Include"):
             return
         row = item.row()
         if row >= len(self._session.records):
@@ -2695,6 +2702,16 @@ class MainWindow(QMainWindow):
         sb.addWidget(self.sb_info, 2)
         sb.addPermanentWidget(self.sb_count)
 
+    @staticmethod
+    def _file_info_text(d: dict) -> str:
+        parts = []
+        if d["exptime"]     is not None: parts.append(f"Exp: {float(d['exptime']):.1f} s")
+        if d["gain_slider"] is not None: parts.append(f"Gain: {d['gain_slider']}")
+        parts.append(f"{d['bitpix']}-bit")
+        if d["camera"] != "Unknown":     parts.append(d["camera"])
+        if d["object"]:                  parts.append(d["object"])
+        return "   |   ".join(parts)
+
     # ── config <-> UI ─────────────────────────────────────────────────────────
     def _load_cfg_to_ui(self):
         self.ctrl_target.set_values(
@@ -2896,14 +2913,8 @@ class MainWindow(QMainWindow):
         self._refresh_all()
         self._process_session_frame()
 
-        parts = []
-        if d["exptime"]     is not None: parts.append(f"Exp: {float(d['exptime']):.1f} s")
-        if d["gain_slider"] is not None: parts.append(f"Gain: {d['gain_slider']}")
-        parts.append(f"{d['bitpix']}-bit")
-        if d["camera"] != "Unknown":     parts.append(d["camera"])
-        if d["object"]:                  parts.append(d["object"])
         self.sb_file.setText(d["filename"])
-        self.sb_info.setText("   |   ".join(parts))
+        self.sb_info.setText(self._file_info_text(d))
 
     # ── refresh ───────────────────────────────────────────────────────────────
     def _refresh_all(self):
@@ -3062,14 +3073,8 @@ class MainWindow(QMainWindow):
             self.cfg["conversion_gain"] = round(e_adu, 4)
             self.cfg["read_noise"]      = round(rn_cam, 2)
         self._refresh_all()
-        parts = []
-        if d["exptime"]     is not None: parts.append(f"Exp: {float(d['exptime']):.1f} s")
-        if d["gain_slider"] is not None: parts.append(f"Gain: {d['gain_slider']}")
-        parts.append(f"{d['bitpix']}-bit")
-        if d["camera"] != "Unknown":     parts.append(d["camera"])
-        if d["object"]:                  parts.append(d["object"])
         self.sb_file.setText(f"[viewing] {d['filename']}")
-        self.sb_info.setText("   |   ".join(parts))
+        self.sb_info.setText(self._file_info_text(d))
 
     def _on_theme_toggle(self, day: bool):
         self.btn_theme.setText("Night Mode" if day else "Day Mode")
@@ -3192,11 +3197,11 @@ def main():
     p.setColor(QPalette.ColorRole.ToolTipBase,     QColor(DARK_PANEL))
     p.setColor(QPalette.ColorRole.ToolTipText,     QColor(TEXT))
     p.setColor(QPalette.ColorRole.Text,            QColor(TEXT))
-    p.setColor(QPalette.ColorRole.Button,          QColor("#1a0500"))
+    p.setColor(QPalette.ColorRole.Button,          QColor(NIGHT_PALETTE["_BTN_BG"]))
     p.setColor(QPalette.ColorRole.ButtonText,      QColor(TEXT_HI))
     p.setColor(QPalette.ColorRole.BrightText,      QColor(ACCENT))
     p.setColor(QPalette.ColorRole.Link,            QColor(ACCENT))
-    p.setColor(QPalette.ColorRole.Highlight,       QColor("#2a0a00"))
+    p.setColor(QPalette.ColorRole.Highlight,       QColor(NIGHT_PALETTE["_SEL_BG"]))
     p.setColor(QPalette.ColorRole.HighlightedText, QColor(ACCENT))
     app.setPalette(p)
 

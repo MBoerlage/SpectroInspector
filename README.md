@@ -4,7 +4,7 @@ With great help from Claude, I wrote an inspector app for spectroscopy data acqu
 
 Stats included in this release: Exposure Advisory; to help stay within the linear range of your CMOS sensor, FWHM on the width of the target (changing FWHM points to changing seeing or slit, guiding issues). There is a tab for Session stats - highlighting outlier subs, and showing how SNR improves towards your target SNR over time. 
 
-Can be used for any slit (StarEx) or slitless (SA100, SA200) spectroscope setup. 
+Can be used for any slit (StarEx) or slitless (SA100, SA200) spectroscope setup. I deliberately did not add a rotation function for the science image, so the diffraction line has to be straight horizontal. 
 
 There is a night mode optimmized for using a red filter on your laptop screen. Day mode will be bright default color scheme. 
 

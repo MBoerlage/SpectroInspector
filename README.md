@@ -1,12 +1,25 @@
 # Spectro Inspector
 
-With great help from Claude, I wrote an inspector app for spectroscopy data acquisition. This app polls your FITS science image folder for new images (any app can take the images such as Sharpcap or NINA: but needs to have basic fits headers) and then runs stats. Your images will remain unaltered (and uncalibrated).  
+Built with major help from Claude, Spectro Inspector is a real-time quality control and session monitoring tool for astronomical spectroscopy acquisition.
 
-Stats included in this release: Exposure Advisory; to help stay within the linear range of your CMOS sensor, FWHM on the width of the target (changing FWHM points to changing seeing or slit, guiding issues). There is a tab for Session stats - highlighting outlier subs, and showing how SNR improves towards your target SNR over time. 
+The app continuously watches your FITS science image folder for new exposures — compatible with acquisition software such as SharpCap or N.I.N.A. (requires basic FITS headers only). Your original science frames remain completely untouched and uncalibrated.
 
-Can be used for any slit (StarEx) or slitless (SA100, SA200) spectroscope setup. I deliberately did not add a rotation function for the science image, so the diffraction line has to be straight horizontal. 
+## Current Features
 
-There is a night mode optimmized for using a red filter on your laptop screen. Day mode will be bright default color scheme. 
+- **Exposure Advisory** — helps keep exposures within the linear range of your CMOS sensor
+- **Target FWHM Monitoring** — tracks spectral profile width to reveal changes in seeing, focus, guiding, or slit alignment
+- **Session Statistics Dashboard** — identifies outlier subs and visualizes cumulative SNR growth toward your target over time
+
+Compatible with both slit spectrographs (Star’Ex) and slitless systems (SA100 / SA200).
+
+To keep the workflow simple and deterministic, the app does not rotate science images — the diffraction spectrum should therefore be aligned horizontally during acquisition.
+
+Includes both:
+
+- **Night Mode** optimized for red-screen observing workflows
+- **Day Mode** with a standard bright interface
+
+Designed for amateur spectroscopists who want fast acquisition feedback without modifying their raw data.
 
 
 ## Screenshots

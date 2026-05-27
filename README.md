@@ -1,6 +1,6 @@
 # Spectro Inspector
 
-With great help from Claude, I wrote an inspector app for spectroscopy data acquisition. This app polls you FITS science image folder for new images (any app can take the images such as Sharpcap or NINA) and then runs stats. Your images will remain unaltered (and uncalibrated).  
+With great help from Claude, I wrote an inspector app for spectroscopy data acquisition. This app polls your FITS science image folder for new images (any app can take the images such as Sharpcap or NINA: but needs to have basic fits headers) and then runs stats. Your images will remain unaltered (and uncalibrated).  
 
 Stats included in this release: Exposure Advisory; to help stay within the linear range of your CMOS sensor, FWHM on the width of the target (changing FWHM points to changing seeing or slit, guiding issues). There is a tab for Session stats - highlighting outlier subs, and showing how SNR improves towards your target SNR over time. 
 

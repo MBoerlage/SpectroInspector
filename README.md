@@ -4,39 +4,77 @@ Built with major help from Claude, Spectro Inspector is a real-time quality cont
 
 The app continuously watches your FITS science image folder for new exposures — compatible with acquisition software such as SharpCap or N.I.N.A. (requires basic FITS headers only). Your original science frames remain completely untouched and uncalibrated.
 
-## Current Features
+## Features
 
-- **Exposure Advisory** — helps keep exposures within the linear range of your CMOS sensor
-- **Target FWHM Monitoring** — tracks spectral profile width to reveal changes in seeing, focus, guiding, or slit alignment
-- **Session Statistics Dashboard** — identifies outlier subs and visualizes cumulative SNR growth toward your target over time
+### Acquisition Control
+- **Filename Filter** — glob pattern filter box (e.g. `*alfCyg*`) limits which files the watcher picks up; live `N/T file(s)` counter shows matched vs total FITS in the folder
+- **Step Through Files** — replay all existing frames one by one before switching to live polling, rebuilding session statistics from scratch
+- **Image Rotation** — ±5° correction spinbox aligns a tilted spectral trace with the horizontal extraction bands; uses bicubic spline interpolation (scipy `order=3, reflect`) so downstream row indices stay valid
+- **Zoom** — rubber-band zoom on the 2D image; spectrum x-axis synchronises automatically
 
-Compatible with both slit spectrographs (Star’Ex) and slitless systems (SA100 / SA200).
+### Exposure Advisory
+- **Peak fill** — how full the brightest target pixel is relative to the saturation threshold
+- **Peak SNR** — signal-to-noise ratio at the brightest wavelength column
+- **Frames: SNR 100** — estimated stacked frames needed to reach SNR 100 (√N scaling)
+- **Noise regime** — background-limited, read-noise-limited, or signal-limited diagnosis
+- **Exp. suggestion** — target exposure time to reach ~80 % of the saturation threshold
+- **Gain Advice** (toggle) — full ASI585MM Pro analysis: HCG mode detection, read noise, full-well, and gain change recommendation
 
-To keep the workflow simple and deterministic, the app does not rotate science images — the diffraction spectrum should therefore be aligned horizontally during acquisition.
+### Spectrum View
+- Extracted bg-subtracted spectrum and raw column sum plotted together
+- Y-axis spans the full sensor dynamic range (`full_range × n_target_rows`) so you can judge how much headroom remains
+- Saturation shading on the spectrum is consistent with the drawn saturation threshold line
+- Optional normalised view and SNR overlay curve
 
-Includes both:
+### Slit Quality Metrics (Session Monitor)
+Replaces the former FWHM-only chart with a four-metric panel, all on a shared **% deviation from session baseline** y-axis. Toggle each metric independently:
 
-- **Night Mode** optimized for red-screen observing workflows
-- **Day Mode** with a standard bright interface
+| Metric | Colour | Description |
+|---|---|---|
+| Integrated Flux | ACCENT (orange) | Total ADU summed across the 1D spectrum per frame. Primary throughput indicator — a sustained drop means the star is walking toward a slit jaw. |
+| Spatial Centroid Y | OK_COL | Flux-weighted centre of the stellar profile in the cross-dispersion direction. Drift → star moving across the slit. |
+| Profile Asymmetry | TEXT_HI | Flux imbalance above vs below the centroid (%). Non-zero → star clipped by one slit edge. Combined with falling flux this is the clearest early slit-loss warning. |
+| Flux RMS | WARN (red) | Rolling standard deviation of Integrated Flux over the last N frames, normalised to session mean. Spikes near a slit edge as seeing fluctuations are amplitude-modulated by the slit transmission function. |
+| FWHM (optional) | TEXT_DIM | Gaussian spatial profile width — seeing/focus indicator, not a centering metric. Warn% and Alarm% threshold lines apply when enabled. |
 
-Designed for amateur spectroscopists who want fast acquisition feedback without modifying their raw data.
+Reference lines at 0 %, ±10 %, ±30 % are drawn at low opacity. The collapsible header summarises all four primary metrics from the latest frame.
 
+### Signal Convergence Monitor
+- Running mean spectrum with ±N σ/√N confidence envelope (envelope width configurable)
+- Persistence score: coloured ticks below the x-axis mark columns where a spectral feature recurs above a threshold fraction of frames
+- Continuum SNR sparkline vs. frame number with an ideal √N reference; three consecutive deviations below it trigger a transparency/guiding warning
+
+### Frame Manager
+- Table of all frames: peak ADU, continuum SNR, FWHM, status
+- **Sortable columns** — click any header to cycle default → ▲ ascending → ▼ descending (numeric sort; Status sorts OK / Flagged / Excluded)
+- Auto-flag rules: Low SNR, High FWHM, Saturated, < 10 continuum columns; thresholds configurable
+- **Include** checkbox to exclude individual frames from Welford session statistics; **Recompute All** replays stats
+- **★ Nominate OK** — auto-selects all unflagged frames into the ★ column; you can manually toggle individual checkboxes, then click **Copy ► \\nominated** to copy those files to a `nominated/` sub-folder
+- **Double-click a row** to switch to Hold display mode and load that frame for inspection; new live frames do not change the displayed image until you click **Latest**
+
+### Logbook
+- Notepad text area auto-linked to `logbook_<Target>.txt` in the watch folder (from FITS `OBJECT` header)
+- Notes auto-saved 5 s after each keystroke and flushed on close
+- **Region settings auto-appended** — whenever you move the TARGET or background bands, the Y-ranges are written to the logbook after a 2-second debounce so they can be referenced later
+
+### Night / Day Theme
+- **Night mode** — red-channel-only palette for use through a red astronomy filter
+- **Day mode** — standard bright interface; toggle button sits in the image section header
 
 ## Screenshots
 
 | | |
 |---|---|
 | ![Saturation detection — day mode](screenshots/SaturationDetection.png) | ![Session monitor — day mode](screenshots/SaturationDetectionSession.png) |
-| **Saturation detection (day mode)** — Red shading highlights saturated columns on both the 2D image and the extracted spectrum. The advisory panel reports the first saturated column and suggests a shorter exposure. | **Session Monitor tab (day mode)** — FWHM trend chart, Signal Convergence with ±σ envelope, SNR-vs-frame sparkline, and Frame Manager table with auto-flagged frames. |
+| **Saturation detection (day mode)** — Red shading highlights saturated columns on both the 2D image and the extracted spectrum. The advisory panel reports the first saturated column and suggests a shorter exposure. | **Session Monitor tab (day mode)** — Slit Quality Metrics chart, Signal Convergence with ±σ envelope, SNR-vs-frame sparkline, and Frame Manager table with auto-flagged frames. |
 | ![Session monitor — night mode](screenshots/SessionMonitor_NightMode.png) | ![Session monitor — night mode, M77](screenshots/SessionMonitor_NightMode_M77.png) |
 | **Session Monitor in night-vision palette** — The full red-channel-only UI for use at the telescope. Signal Convergence, SNR sparkline, and Frame Manager shown across 10 frames. | **Night mode — M77** — Convergence chart showing persistent spectral features (coloured ticks below x-axis), 5 stacked frames with √N SNR growth tracked in the sparkline. |
-
 
 
 ## Requirements
 
 - Python 3.11+
-- `astropy`, `numpy`, `matplotlib`, `PyQt6`
+- `astropy`, `numpy`, `matplotlib`, `PyQt6`, `scipy`
 
 ## Installation
 
@@ -69,35 +107,41 @@ python spectro_tool.py
 1. Click **Select Folder** and point it at your FITS output directory.
    The tool loads the most recent file immediately and watches for new ones.
 
-2. Drag the coloured handles on the image (or edit the spinboxes) to place the
+2. Optionally enter a **Filter** pattern (e.g. `*alfCyg*`) to restrict which files are picked up. The `N/T file(s)` counter updates in real time.
+
+3. Drag the coloured handles on the image (or edit the spinboxes) to place the
    **TARGET** and background (**BG ABOVE / BG BELOW**) extraction bands over your star trace.
 
-3. Read the **Exposure Advisory** panel:
+4. If the spectral trace is not perfectly horizontal, use the **Rotate°** spinbox to correct the tilt. The rotation is applied in memory — raw files are never modified.
+
+5. Read the **Exposure Advisory** panel:
    - **Peak fill** — how full the brightest pixel is relative to the saturation threshold
    - **Peak SNR** — signal-to-noise at the brightest wavelength column
    - **Frames: SNR 100** — how many stacked exposures are needed to reach SNR 100
    - **Noise regime** — tells you whether longer exposures or more frames helps most
-   - **Exp. suggestion** — suggested exposure time to hit ~80% of the saturation threshold
+   - **Exp. suggestion** — suggested exposure time to hit ~80 % of the saturation threshold
 
-4. Enable **Gain Advice** for a full ASI585MM Pro gain analysis (HCG mode awareness).
+6. Enable **Gain Advice** (button in the Exposure Advisory header) for a full ASI585MM Pro gain analysis.
 
-5. Use **⊕ Zoom Box** to draw a rectangle on the image and zoom in; the spectrum X-axis synchronises automatically. Click **↺ Reset View** to return to the full frame.
+7. Use **⊕ Zoom** to draw a rectangle on the image and zoom in; the spectrum X-axis synchronises automatically. Click **↺ Reset** to return to the full frame.
 
-6. Switch to the **Session Monitor** tab to track multi-frame session quality.
+8. Switch to the **Session Monitor** tab to track multi-frame session quality. Expand the **Slit Quality Metrics** panel to monitor flux, centroid, asymmetry, and RMS stability in real time.
+
+9. In the **Frame Manager**, double-click any row to hold and inspect that frame. Use **★ Nominate OK** to collect clean frames and copy them to a `nominated/` subfolder.
 
 ## Session Monitor
 
 Set the **Flatness threshold** (ADU/column) to control which wavelength columns are considered flat continuum (free of strong spectral lines). Default 500 ADU/col.
 
-**▶ Spatial FWHM Monitor** — Tracks the stellar trace width (seeing) per frame using a Gaussian fit to the spatial profile of continuum columns. Baseline is set from the first reliable fits. Warn% and Alarm% thresholds trigger colour-coded alerts.
+**▶ Slit Quality Metrics** — Four metrics on a shared % from baseline y-axis: Integrated Flux, Spatial Centroid Y, Profile Asymmetry, and Flux RMS (rolling window, configurable). FWHM is available as an optional fifth metric. Baseline is the mean of the first 5 included frames with a valid value for each metric. Toggle checkboxes to show/hide individual metrics.
 
 **▶ Signal Convergence Monitor** — Running mean spectrum with ±Nσ confidence envelope. Coloured ticks mark columns where a spectral feature persists across frames. The SNR sparkline shows actual vs ideal √N growth; three consecutive deviations trigger a transparency/guiding warning.
 
-**▶ Frame Manager** — Every frame with its peak ADU, continuum SNR, FWHM, and inclusion status. Auto-flag rules: Low SNR, High FWHM, Saturated, < 10 continuum columns. Uncheck **Include** to exclude a frame; click **Recompute All** to replay Welford statistics.
+**▶ Frame Manager** — Every frame with its peak ADU, continuum SNR, FWHM, and inclusion status. Click column headers to sort. Auto-flag rules: Low SNR, High FWHM, Saturated, < 10 continuum columns. Double-click a row to inspect that frame in Hold mode. Use **★ Nominate OK** to select and export clean frames to a `nominated/` sub-folder.
 
 ## Logbook
 
-A notepad in the lower-left panel. When a FITS file with an `OBJECT` header keyword is loaded, the logbook automatically opens or creates `logbook_<Target>.txt` in the watch folder. Notes are auto-saved 5 seconds after each keystroke and flushed on close.
+A notepad in the lower-left panel. When a FITS file with an `OBJECT` header keyword is loaded, the logbook automatically opens or creates `logbook_<Target>.txt` in the watch folder. Notes are auto-saved 5 seconds after each keystroke and flushed on close. Whenever extraction region boundaries change, the current TARGET and BG Y-ranges are automatically appended as a timestamped line.
 
 ## Camera Notes — ZWO ASI 585MM Pro
 
@@ -130,6 +174,10 @@ Settings are saved automatically to `spectro_config.json` in the same folder (ex
 | `target_fill` | 0.80 | Desired fill fraction for exposure suggestions |
 | `poll_interval_ms` | 2000 | Folder polling interval (ms) |
 | `flatness_threshold` | 500.0 | Derivative threshold for continuum column detection |
+| `file_filter` | `""` | Filename glob filter (e.g. `*alfCyg*`); empty = all files |
+| `rotation_angle` | 0.0 | Image rotation in degrees (±5°) |
+| `envelope_sigma` | 1.0 | Convergence envelope width in σ/√N units |
+| `persistence_threshold` | 0.70 | Fraction of frames a feature must appear in to be marked |
 
 ## License
 

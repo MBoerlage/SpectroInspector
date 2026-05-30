@@ -10,10 +10,13 @@ Night-vision palette: all elements distinguished by RED-CHANNEL BRIGHTNESS only
 import sys
 import math
 import json
+import fnmatch
+import shutil
 from pathlib import Path
 from dataclasses import dataclass, field
 
 import numpy as np
+from scipy.ndimage import rotate
 
 try:
     from astropy.io import fits as pyfits
@@ -28,7 +31,7 @@ try:
         QSpinBox, QDoubleSpinBox, QGroupBox, QSlider, QCheckBox,
         QFileDialog, QStatusBar, QSizePolicy, QFrame,
         QTabWidget, QTableWidget, QTableWidgetItem, QPlainTextEdit,
-        QScrollArea,
+        QScrollArea, QLineEdit, QAbstractSpinBox,
     )
     from PyQt6.QtCore import Qt, QThread, pyqtSignal, QPoint, QTimer
     from PyQt6.QtGui import QPalette, QColor, QCursor, QFont
@@ -41,7 +44,7 @@ try:
     from matplotlib.backends.backend_qtagg import FigureCanvasQTAgg as FigureCanvas
     from matplotlib.figure import Figure
     from matplotlib.patches import Rectangle
-    from matplotlib.ticker import FuncFormatter
+    from matplotlib.ticker import FuncFormatter, MaxNLocator
 except ImportError:
     print("ERROR: matplotlib not found.  Run:  pip install matplotlib"); sys.exit(1)
 
@@ -85,6 +88,7 @@ _section_titles:       list = []   # title QLabels registered by section_box()
 _section_boxes:        list = []   # QGroupBox instances registered by section_box()
 _section_seps:         list = []   # separator QFrames registered by section_box()
 _section_help_buttons: list = []   # HelpButton instances registered by section_box()
+_arrow_btns_list:      list = []   # all ▲/▼ QPushButtons created by _arrow_btns()
 _cur_pal: dict = NIGHT_PALETTE   # mutable reference to active palette
 _is_day_mode: bool = False
 
@@ -123,9 +127,11 @@ QPushButton:pressed    {{ background-color:{DARK_BORDER}; }}
 QPushButton:checked    {{ background-color:{_cur_pal["_SEL_BG"]}; border:1px solid {ACCENT}; color:{ACCENT}; }}
 QRadioButton           {{ color:{TEXT}; font-size:{F_BASE}; }}
 QCheckBox              {{ color:{TEXT}; font-size:{F_BASE}; }}
-QSpinBox, QDoubleSpinBox {{ background-color:{DARK_PANEL}; color:{ACCENT};
+QSpinBox, QDoubleSpinBox, QLineEdit {{ background-color:{DARK_PANEL}; color:{ACCENT};
                           border:1px solid {DARK_BORDER}; border-radius:2px;
                           padding:3px; font-size:{F_BASE}; }}
+QSpinBox::up-button, QDoubleSpinBox::up-button {{ width:0px; border:none; }}
+QSpinBox::down-button, QDoubleSpinBox::down-button {{ width:0px; border:none; }}
 QSlider::groove:horizontal {{ background:{DARK_BORDER}; height:5px; border-radius:2px; }}
 QSlider::handle:horizontal {{ background:{ACCENT}; width:16px; height:16px;
                                margin:-6px 0; border-radius:8px; }}
@@ -276,17 +282,32 @@ SNR_stack = SNR_single × √N_frames.<br><br>
 """,
 
 "fwhm": """
-<b>Spatial FWHM Monitor</b><br><br>
-Tracks the stellar trace width (in pixels) per frame as a real-time session KPI.<br><br>
-<b>Pipeline</b>: For each frame the tool identifies <i>continuum columns</i> using the
-flatness filter (derivative threshold), median-combines their spatial profiles,
-then fits a Gaussian. FWHM = 2.355 × sigma.<br><br>
-<b>Color coding</b>:<br>
-• Orange (OK_COL) — within Warn% of session baseline<br>
-• Bright orange (ACCENT) — between Warn% and Alarm% above baseline<br>
-• Red — more than Alarm% above baseline, or Gaussian fit unreliable<br><br>
-<b>Unreliable fits</b> (fit residuals too high) are plotted as dim points
-and excluded from the baseline calculation.
+<b>Slit Quality Metrics</b><br><br>
+All metrics are plotted as <b>% deviation from the session baseline</b>
+(mean of the first 5 valid frames), sharing one y-axis. A flat trace near
+0 % means that metric is stable. Toggle each metric with the checkboxes
+above the chart.<br><br>
+
+<b>Integrated Flux</b> — Total ADU summed across the extracted 1D spectrum per
+frame. Direct measure of starlight throughput through the slit. A sustained
+downward drift means the star has moved toward or beyond a slit jaw.<br><br>
+
+<b>Spatial Centroid Y</b> — Flux-weighted centre of the stellar profile in the
+cross-dispersion (Y) direction, in pixels. Slow drift indicates the star is
+walking across the slit. A sudden jump suggests a guiding disturbance.<br><br>
+
+<b>Profile Asymmetry</b> — Imbalance of flux above vs below the centroid,
+plotted as %. Zero = symmetric. Non-zero means the star is being clipped by
+one slit jaw. Rising asymmetry + falling flux = early warning of a slit edge.<br><br>
+
+<b>Flux RMS</b> — Rolling standard deviation of Integrated Flux over the last N
+frames (set by RMS window spinbox), normalised to session mean flux. Spikes
+near a slit edge as seeing fluctuations become amplitude-modulated by the slit
+transmission — the quantitative signature of yo-yoing across the edge.<br><br>
+
+<b>FWHM</b> (optional, off by default) — Gaussian width of the spatial profile
+in pixels. A focus and seeing quality indicator, <i>not</i> a centering metric.
+The Warn% and Alarm% thresholds apply to FWHM when enabled.
 """,
 
 "convergence": """
@@ -394,18 +415,22 @@ class HelpButton(QLabel):
         super().mousePressEvent(event)
 
 
-def section_box(title: str, help_key: str | None = None) -> tuple[QGroupBox, QVBoxLayout]:
-    """Return a styled QGroupBox and its inner layout, with optional ⓘ button."""
+def section_box(title: str, help_key: str | None = None,
+                header_extra: list | None = None) -> tuple[QGroupBox, QVBoxLayout]:
+    """Return a styled QGroupBox and its inner layout, with optional ⓘ button.
+
+    header_extra: optional list of QWidgets appended to the header row (before the stretch).
+    """
     grp = QGroupBox()
     inner = QVBoxLayout(grp)
     inner.setContentsMargins(6, 4, 6, 6)
     inner.setSpacing(4)
 
-    # Header row: title + help button
+    # Header row: title + help button + optional extras
     header = QWidget()
     hl = QHBoxLayout(header)
     hl.setContentsMargins(0, 0, 0, 0)
-    hl.setSpacing(2)
+    hl.setSpacing(4)
     tlbl = QLabel(title)
     tlbl.setStyleSheet(f"color:{TEXT_HI}; font-size:{F_TITLE}; font-weight:bold; border:none;")
     _section_titles.append(tlbl)
@@ -414,6 +439,9 @@ def section_box(title: str, help_key: str | None = None) -> tuple[QGroupBox, QVB
         hbtn = HelpButton(HELP[help_key])
         _section_help_buttons.append(hbtn)
         hl.addWidget(hbtn)
+    if header_extra:
+        for w in header_extra:
+            hl.addWidget(w)
     hl.addStretch()
     inner.addWidget(header)
 
@@ -436,11 +464,38 @@ def section_box(title: str, help_key: str | None = None) -> tuple[QGroupBox, QVB
     return grp, inner
 
 
+def _arrow_btns(spinbox: QAbstractSpinBox) -> "QWidget":
+    """Return a stacked [▲/▼] widget wired to spinbox; hides spinbox's native buttons.
+
+    All buttons are registered in the module-level _arrow_btns_list so
+    _switch_theme() can restyle them in a single pass.
+    """
+    spinbox.setButtonSymbols(QAbstractSpinBox.ButtonSymbols.NoButtons)
+    w = QWidget()
+    vl = QVBoxLayout(w)
+    vl.setContentsMargins(0, 0, 0, 0)
+    vl.setSpacing(1)
+    w.setFixedWidth(20)
+    _sty = (f"font-size:9pt; padding:0px; color:{DARK_BG}; "
+            f"background:{TEXT_HI}; border:1px solid {DARK_BORDER};")
+    for sym, fn in (("▲", spinbox.stepUp), ("▼", spinbox.stepDown)):
+        btn = QPushButton(sym)
+        btn.setFixedHeight(13)
+        btn.setFixedWidth(20)
+        btn.setStyleSheet(_sty)
+        btn.clicked.connect(fn)
+        vl.addWidget(btn)
+        _arrow_btns_list.append(btn)
+    return w
+
+
 # ── Config ─────────────────────────────────────────────────────────────────────
 CONFIG_FILE = Path(__file__).with_name("spectro_config.json")
 
 DEFAULTS: dict = {
     "watch_folder":         "",
+    "file_filter":          "",
+    "rotation_angle":       0.0,
     "target_y_start":       1000,
     "target_y_end":         1160,
     "bg_above_y_start":     880,
@@ -466,7 +521,7 @@ DEFAULTS: dict = {
     "fwhm_warn_pct":             20.0,
     "fwhm_alarm_pct":            50.0,
     "gaussian_residual_thresh":  0.30,
-    "envelope_sigma":            2.0,
+    "envelope_sigma":            1.0,
     "persistence_threshold":     0.70,
     "snr_target":                0,
     "autoflag_snr_sigma":        2.0,
@@ -537,10 +592,11 @@ def load_fits(filepath: str) -> dict | None:
 class FolderWatcher(QThread):
     new_file_found = pyqtSignal(str)
 
-    def __init__(self, folder: str, interval_ms: int = 2000):
+    def __init__(self, folder: str, interval_ms: int = 2000, filter_pattern: str = ""):
         super().__init__()
         self.folder = folder
         self.interval_ms = interval_ms
+        self.filter_pattern = filter_pattern
         self._running = True
         self._known: set[str] = set()
         self._latest: str | None = None
@@ -548,10 +604,17 @@ class FolderWatcher(QThread):
 
     def _glob(self) -> list[Path]:
         p = Path(self.folder)
+        seen: set[str] = set()
         files: list[Path] = []
         if p.exists():
             for pat in ("*.fits", "*.fit", "*.FITS", "*.FIT"):
-                files.extend(p.glob(pat))
+                for f in p.glob(pat):
+                    key = str(f.resolve()).lower()
+                    if key not in seen:
+                        seen.add(key)
+                        files.append(f)
+        if self.filter_pattern:
+            files = [f for f in files if fnmatch.fnmatch(f.name, self.filter_pattern)]
         return files
 
     def _scan_existing(self):
@@ -559,6 +622,11 @@ class FolderWatcher(QThread):
         self._known = {str(f) for f in files}
         if files:
             self._latest = str(max(files, key=lambda f: f.stat().st_mtime))
+
+    def apply_filter(self, pattern: str):
+        """Update the filter and re-scan so count/latest reflect the new pattern."""
+        self.filter_pattern = pattern
+        self._scan_existing()
 
     def run(self):
         while self._running:
@@ -583,8 +651,25 @@ class FolderWatcher(QThread):
     def count(self) -> int:
         return len(self._known)
 
+    def total_count(self) -> int:
+        """Number of FITS files in the folder ignoring any filename filter."""
+        p = Path(self.folder)
+        seen: set[str] = set()
+        if p.exists():
+            for pat in ("*.fits", "*.fit", "*.FITS", "*.FIT"):
+                for f in p.glob(pat):
+                    seen.add(str(f.resolve()).lower())
+        return len(seen)
+
 
 # ── Math helpers ───────────────────────────────────────────────────────────────
+def rotate_image(data: np.ndarray, angle_deg: float) -> np.ndarray:
+    if abs(angle_deg) < 1e-4:
+        return data
+    return rotate(data, angle_deg,
+                  reshape=False, order=3, mode='reflect', prefilter=True).astype(np.float32)
+
+
 def arcsinh_stretch(data: np.ndarray, slider: int) -> tuple[np.ndarray, float, float]:
     """Arcsinh stretch.  slider 1 (linear) -> 10 (aggressive).  Returns (disp, 0, 1)."""
     beta  = 10.0 ** (-(slider - 1) * 2.0 / 9.0)
@@ -771,9 +856,12 @@ class FrameRecord:
     peak_adu:      float         = 0.0
     sat_limit:     float         = 0.0
     continuum_snr: float | None  = None
-    fwhm_px:       float | None  = None
-    fwhm_reliable: bool          = True
-    n_continuum:   int           = 0
+    fwhm_px:           float | None  = None
+    fwhm_reliable:     bool          = True
+    n_continuum:       int           = 0
+    spatial_centroid:  float | None  = None
+    profile_asymmetry: float | None  = None
+    total_flux:        float | None  = None
     inclusion:     str           = "included"   # 'included' | 'excluded' | 'flagged'
     flag_reasons:  list          = field(default_factory=list)
     user_kept:     bool          = False        # flagged but user explicitly chose to keep
@@ -885,6 +973,28 @@ class SessionData:
         vals = [r.fwhm_px for r in self.included
                 if r.fwhm_px is not None and r.fwhm_reliable]
         return float(np.std(vals)) if len(vals) >= 2 else None
+
+    def _baseline5(self, attr: str) -> float | None:
+        vals = []
+        for r in self.included:
+            v = getattr(r, attr)
+            if v is not None:
+                vals.append(v)
+                if len(vals) == 5:
+                    break
+        return float(np.mean(vals)) if len(vals) >= 5 else None
+
+    @property
+    def baseline_total_flux(self) -> float | None:
+        return self._baseline5("total_flux")
+
+    @property
+    def baseline_centroid(self) -> float | None:
+        return self._baseline5("spatial_centroid")
+
+    @property
+    def baseline_asymmetry(self) -> float | None:
+        return self._baseline5("profile_asymmetry")
 
     @property
     def mean_cont_snr(self) -> float | None:
@@ -1211,16 +1321,32 @@ class SpectrumCanvas(FigureCanvas):
         self.ax.axhline(sat_line,  color=SAT_C,  lw=1.0, ls="--", alpha=0.85,
                         label=f"Sat. limit ({int(cfg['saturation_threshold']*100)}%)", zorder=4)
 
-        # Saturation column shading
-        for cs, ce in sat_runs(data, sat_limit,
-                               y0=cfg["target_y_start"], y1=cfg["target_y_end"]):
-            self.ax.axvspan(cs - 0.5, ce + 0.5, facecolor=SAT_C, alpha=0.18, zorder=3)
+        # Saturation column shading — compare raw column sum to sat_line so shading
+        # is consistent with the drawn sat_line (not individual-pixel threshold).
+        raw_for_shade = raw_plot if normalize else tsum
+        shade_mask = raw_for_shade > sat_line
+        in_run = False
+        for i, s in enumerate(shade_mask):
+            if s and not in_run:  start = i; in_run = True
+            elif not s and in_run:
+                self.ax.axvspan(start - 0.5, i - 1.5, facecolor=SAT_C, alpha=0.18, zorder=3)
+                in_run = False
+        if in_run:
+            self.ax.axvspan(start - 0.5, len(shade_mask) - 0.5,
+                            facecolor=SAT_C, alpha=0.18, zorder=3)
 
-        # Y autoscale to extracted spectrum
-        smin = float(np.min(sp_plot)); smax = float(np.max(sp_plot))
-        pad  = max((smax - smin) * 0.06, 1.0)
-        ytop = max(smax + pad, sat_line if sat_line < smax * 3 else smax + pad)
-        self.ax.set_ylim(smin - pad, ytop + pad)
+        # Y axis: full ADU range when not normalized, autoscale when normalized
+        if normalize:
+            smin = float(np.min(sp_plot)); smax = float(np.max(sp_plot))
+            pad  = max((smax - smin) * 0.06, 1.0)
+            ytop = max(smax + pad, sat_line if sat_line < smax * 3 else smax + pad)
+            self.ax.set_ylim(smin - pad, ytop + pad)
+        else:
+            full_scale = full_range * n          # max possible column sum
+            sp_floor   = min(float(np.min(sp_plot)), 0.0)
+            self.ax.set_ylim(sp_floor, full_scale * 1.02)
+            self.ax.axhline(full_scale, color=TEXT_DIM, lw=0.7, ls="--",
+                            alpha=0.5, label=f"Linear ADU ×{n} rows", zorder=2)
 
         ylabel = "Intensity (norm.)" if normalize else "Intensity (ADU · rows)"
         self.ax.set_xlabel("X pixel  (∝ wavelength)", color=TEXT, fontsize=9)
@@ -1275,7 +1401,11 @@ class AdvisoryPanel(QWidget):
         outer.setSpacing(4)
 
         # ── Exposure Advisory ──
-        exp_grp, exp_lay = section_box("Exposure Advisory", "advisory")
+        self.btn_gain = QPushButton("Gain Advice: OFF")
+        self.btn_gain.setCheckable(True)
+        self.btn_gain.setFixedWidth(175)
+        exp_grp, exp_lay = section_box("Exposure Advisory", "advisory",
+                                       header_extra=[self.btn_gain])
         g = QGridLayout()
         g.setVerticalSpacing(2)
         g.setHorizontalSpacing(6)
@@ -1452,7 +1582,7 @@ class AdvisoryPanel(QWidget):
             return
 
         g_val = float(gs)
-        _e_adu, rn_cam, fw_e = interp_gain(g_val)
+        e_adu, rn_cam, fw_e = interp_gain(g_val)
         in_hcg = g_val >= HCG_THRESHOLD
 
         bg_e_px = float(np.mean(np.maximum(bg_per_row, 0.0))) * G
@@ -1548,7 +1678,10 @@ class RegionControl(QWidget):
         self.y1.valueChanged.connect(self.changed.emit)
         self._arr = QLabel("->")
         self._arr.setStyleSheet(f"font-size:10pt; color:{TEXT_DIM}; border:none;")
-        for w in (self._dot, self._band_lbl, QLabel("Y:"), self.y0, self._arr, self.y1):
+        ab0 = _arrow_btns(self.y0)
+        ab1 = _arrow_btns(self.y1)
+        for w in (self._dot, self._band_lbl, QLabel("Y:"), self.y0, ab0,
+                  self._arr, self.y1, ab1):
             lay.addWidget(w)
         lay.addStretch()
 
@@ -1571,7 +1704,7 @@ class RegionControl(QWidget):
 
 
 # ── FWHM trend canvas ────────────────────────────────────────────────────────
-class FWHMCanvas(FigureCanvas):
+class SessionMetricsCanvas(FigureCanvas):
     def __init__(self):
         self.fig = Figure(facecolor=DARK_BG)
         super().__init__(self.fig)
@@ -1580,48 +1713,130 @@ class FWHMCanvas(FigureCanvas):
         self.fig.subplots_adjust(left=0.14, right=0.97, top=0.92, bottom=0.22)
         self.setSizePolicy(QSizePolicy.Policy.Expanding, QSizePolicy.Policy.Expanding)
 
-    def refresh(self, session: SessionData, warn_pct: float, alarm_pct: float):
+    def refresh(self, session: SessionData,
+                show_flux: bool, show_centroid: bool,
+                show_asymmetry: bool, show_flux_rms: bool, show_fwhm: bool,
+                warn_pct: float, alarm_pct: float, rms_window: int):
         self.fig.set_facecolor(DARK_BG)
         self.ax.cla()
         self.ax.set_facecolor(DARK_BG)
         for sp in self.ax.spines.values(): sp.set_edgecolor(DARK_BORDER)
         self.ax.tick_params(colors=TEXT, labelsize=8)
+        self.ax.xaxis.set_major_locator(MaxNLocator(integer=True))
         self.ax.set_xlabel("Included frame #", color=TEXT, fontsize=9)
-        self.ax.set_ylabel("FWHM (px)", color=TEXT, fontsize=9)
-        self.ax.set_title("Spatial FWHM", color=TEXT_HI, fontsize=9, pad=3)
+        self.ax.set_ylabel("% from baseline", color=TEXT, fontsize=9)
+        self.ax.set_title("Slit Quality Metrics", color=TEXT_HI, fontsize=9, pad=3)
 
-        bl = session.baseline_fwhm
-        xs, ys, cs = [], [], []
-        for i, rec in enumerate(session.included, 1):
-            if rec.fwhm_px is None:
-                continue
-            xs.append(i)
-            ys.append(rec.fwhm_px)
-            if not rec.fwhm_reliable:
-                cs.append(TEXT_DIM)
-            elif bl is not None and rec.fwhm_px > bl * (1 + alarm_pct / 100):
-                cs.append(WARN)
-            elif bl is not None and rec.fwhm_px > bl * (1 + warn_pct / 100):
-                cs.append(ACCENT)
-            else:
-                cs.append(OK_COL)
-
-        if xs:
-            self.ax.plot(xs, ys, color=TEXT_DIM, lw=0.8, zorder=2)
-            for x, y, c in zip(xs, ys, cs):
-                self.ax.scatter([x], [y], color=c, s=22, zorder=3)
-            if bl is not None:
-                self.ax.axhline(bl, color=OK_COL, lw=0.8, ls="--", alpha=0.7,
-                                label=f"baseline {bl:.1f}px")
-                self.ax.axhline(bl * (1 + warn_pct / 100),
-                                color=ACCENT, lw=0.6, ls=":", alpha=0.6)
-                self.ax.axhline(bl * (1 + alarm_pct / 100),
-                                color=WARN,  lw=0.6, ls=":", alpha=0.6)
-                self.ax.legend(loc="upper left", fontsize=7,
-                               facecolor=DARK_PANEL, edgecolor=DARK_BORDER, labelcolor=TEXT)
-        else:
-            self.ax.text(0.5, 0.5, "No FWHM data yet", color=TEXT_DIM,
+        included = list(session.included)
+        any_metric = show_flux or show_centroid or show_asymmetry or show_flux_rms or show_fwhm
+        if not included or not any_metric:
+            self.ax.text(0.5, 0.5, "No data yet", color=TEXT_DIM,
                          ha="center", va="center", transform=self.ax.transAxes, fontsize=10)
+            self.draw_idle()
+            return
+
+        xs = list(range(1, len(included) + 1))
+
+        def _pct_series(attr: str, baseline: float | None):
+            if baseline is None or abs(baseline) < 1e-9:
+                return [], []
+            vx, vy = [], []
+            for i, r in enumerate(included):
+                v = getattr(r, attr)
+                if v is not None:
+                    vx.append(xs[i])
+                    vy.append((v - baseline) / abs(baseline) * 100.0)
+            return vx, vy
+
+        any_plotted = False
+
+        # ── Integrated Flux ────────────────────────────────────────────────
+        if show_flux:
+            bl = session.baseline_total_flux
+            vx, vy = _pct_series("total_flux", bl)
+            if vx:
+                self.ax.plot(vx, vy, color=ACCENT, lw=0.8, zorder=2)
+                self.ax.scatter(vx, vy, color=ACCENT, s=22, zorder=3,
+                                label=f"Flux ({vy[-1]:+.1f}%)")
+                any_plotted = True
+
+        # ── Spatial Centroid Y ─────────────────────────────────────────────
+        if show_centroid:
+            bl = session.baseline_centroid
+            vx, vy = _pct_series("spatial_centroid", bl)
+            if vx:
+                self.ax.plot(vx, vy, color=OK_COL, lw=0.8, zorder=2)
+                self.ax.scatter(vx, vy, color=OK_COL, s=22, zorder=3,
+                                label=f"Centroid ({vy[-1]:+.1f}%)")
+                any_plotted = True
+
+        # ── Profile Asymmetry ──────────────────────────────────────────────
+        if show_asymmetry:
+            vx, vy = [], []
+            for i, r in enumerate(included):
+                if r.profile_asymmetry is not None:
+                    vx.append(xs[i])
+                    vy.append(r.profile_asymmetry * 100.0)   # direct %, not vs baseline
+            if vx:
+                self.ax.plot(vx, vy, color=TEXT_HI, lw=0.8, zorder=2)
+                self.ax.scatter(vx, vy, color=TEXT_HI, s=22, zorder=3,
+                                label=f"Asymmetry ({vy[-1]:+.1f}%)")
+                any_plotted = True
+
+        # ── Flux RMS (rolling std) ─────────────────────────────────────────
+        if show_flux_rms:
+            all_fx = [(i, r.total_flux) for i, r in enumerate(included)
+                      if r.total_flux is not None]
+            if len(all_fx) >= rms_window:
+                mean_f = abs(np.mean([f for _, f in all_fx])) or 1.0
+                rms_x, rms_y = [], []
+                for j in range(rms_window - 1, len(all_fx)):
+                    win = [f for _, f in all_fx[j - rms_window + 1: j + 1]]
+                    rms_x.append(all_fx[j][0] + 1)
+                    rms_y.append(float(np.std(win)) / mean_f * 100.0)
+                if rms_x:
+                    self.ax.plot(rms_x, rms_y, color=WARN, lw=0.8, zorder=2)
+                    self.ax.scatter(rms_x, rms_y, color=WARN, s=22, zorder=3,
+                                    label=f"Flux RMS ({rms_y[-1]:.1f}%)")
+                    any_plotted = True
+
+        # ── FWHM (optional) ───────────────────────────────────────────────
+        if show_fwhm:
+            bl = session.baseline_fwhm
+            if bl is not None and abs(bl) > 1e-9:
+                vx, vy, vc = [], [], []
+                for i, r in enumerate(included):
+                    if r.fwhm_px is None:
+                        continue
+                    pct = (r.fwhm_px - bl) / abs(bl) * 100.0
+                    vx.append(xs[i]); vy.append(pct)
+                    if not r.fwhm_reliable:       vc.append(TEXT_DIM)
+                    elif pct > alarm_pct:          vc.append(WARN)
+                    elif pct > warn_pct:           vc.append(ACCENT)
+                    else:                          vc.append(TEXT_DIM)
+                if vx:
+                    self.ax.plot(vx, vy, color=TEXT_DIM, lw=0.8, zorder=2)
+                    for xi, yi, ci in zip(vx, vy, vc):
+                        self.ax.scatter([xi], [yi], color=ci, s=22, zorder=3)
+                    self.ax.axhline(warn_pct,  color=ACCENT, lw=0.5, ls=":", alpha=0.35)
+                    self.ax.axhline(alarm_pct, color=WARN,   lw=0.5, ls=":", alpha=0.35)
+                    any_plotted = True
+
+        if not any_plotted:
+            self.ax.text(0.5, 0.5, "Waiting for baseline (5 frames)…",
+                         color=TEXT_DIM, ha="center", va="center",
+                         transform=self.ax.transAxes, fontsize=9)
+
+        # Reference lines
+        self.ax.axhline(0,   color=TEXT,     lw=0.8, alpha=0.5, zorder=1)
+        self.ax.axhline( 10, color=TEXT_DIM, lw=0.5, ls=":", alpha=0.25, zorder=1)
+        self.ax.axhline(-10, color=TEXT_DIM, lw=0.5, ls=":", alpha=0.25, zorder=1)
+        self.ax.axhline( 30, color=TEXT_DIM, lw=0.5, ls=":", alpha=0.25, zorder=1)
+        self.ax.axhline(-30, color=TEXT_DIM, lw=0.5, ls=":", alpha=0.25, zorder=1)
+
+        if any_plotted:
+            self.ax.legend(loc="upper left", fontsize=7,
+                           facecolor=DARK_PANEL, edgecolor=DARK_BORDER, labelcolor=TEXT)
         self.draw_idle()
 
 
@@ -1713,6 +1928,7 @@ class SNRSparklineCanvas(FigureCanvas):
         self.ax.set_facecolor(DARK_BG)
         for sp in self.ax.spines.values(): sp.set_edgecolor(DARK_BORDER)
         self.ax.tick_params(colors=TEXT, labelsize=7)
+        self.ax.xaxis.set_major_locator(MaxNLocator(integer=True))
         self.ax.set_xlabel("Included frame #", color=TEXT, fontsize=7)
         self.ax.set_ylabel("Cont. SNR", color=TEXT, fontsize=7)
         title_snr = "Continuum SNR vs. Frame"
@@ -1757,14 +1973,13 @@ class FWHMPanel(QWidget):
 
         # ── collapsible header ────────────────────────────────────────────────
         self._expanded = False
-        self._hdr = QPushButton("▶ Spatial FWHM Monitor  —  FWHM: —")
+        self._hdr = QPushButton("▶ Slit Quality  —  Flux: —  Cen: —  Asym: —  RMS: —")
         self._hdr.setCheckable(True)
         self._hdr.setStyleSheet(f"""
             QPushButton {{
                 text-align:left; padding:4px 8px;
                 background:{DARK_PANEL}; color:{TEXT};
-                border:1px solid {DARK_BORDER}; border-radius:3px;
-                font-size:11pt;
+                border:1px solid {DARK_BORDER}; border-radius:3px; font-size:11pt;
             }}
             QPushButton:checked {{ color:{ACCENT}; }}
         """)
@@ -1783,19 +1998,22 @@ class FWHMPanel(QWidget):
         bl.setContentsMargins(4, 2, 4, 2)
         bl.setSpacing(3)
 
-        kpi_row = QWidget()
-        kl = QHBoxLayout(kpi_row)
-        kl.setContentsMargins(0, 0, 0, 0); kl.setSpacing(12)
-        self._lbl_fwhm = QLabel("FWHM: —")
-        self._lbl_fwhm.setStyleSheet(
-            f"color:{ACCENT}; font-size:{F_VAL}; font-weight:bold; border:none;")
-        self._lbl_baseline = QLabel("baseline: —")
-        self._lbl_baseline.setStyleSheet(
-            f"color:{TEXT_DIM}; font-size:11pt; border:none;")
-        kl.addWidget(self._lbl_fwhm); kl.addWidget(self._lbl_baseline); kl.addStretch()
-        bl.addWidget(kpi_row)
+        # Toggle row
+        tog_row = QWidget()
+        tl = QHBoxLayout(tog_row)
+        tl.setContentsMargins(0, 0, 0, 0); tl.setSpacing(10)
+        self.cb_flux      = QCheckBox("Integrated Flux"); self.cb_flux.setChecked(True)
+        self.cb_centroid  = QCheckBox("Spatial Centroid"); self.cb_centroid.setChecked(True)
+        self.cb_asymmetry = QCheckBox("Profile Asymmetry"); self.cb_asymmetry.setChecked(True)
+        self.cb_rms       = QCheckBox("Flux RMS"); self.cb_rms.setChecked(True)
+        self.cb_fwhm      = QCheckBox("FWHM"); self.cb_fwhm.setChecked(False)
+        for cb in (self.cb_flux, self.cb_centroid, self.cb_asymmetry, self.cb_rms, self.cb_fwhm):
+            cb.toggled.connect(self._do_refresh)
+            tl.addWidget(cb)
+        tl.addStretch()
+        bl.addWidget(tog_row)
 
-        self._canvas = FWHMCanvas()
+        self._canvas = SessionMetricsCanvas()
         bl.addWidget(self._canvas)
 
         cfg_row = QWidget()
@@ -1805,12 +2023,20 @@ class FWHMPanel(QWidget):
         self.spin_warn = QSpinBox()
         self.spin_warn.setRange(5, 100); self.spin_warn.setValue(20)
         self.spin_warn.setFixedWidth(58)
-        cl.addWidget(self.spin_warn)
+        self.spin_warn.valueChanged.connect(self._do_refresh)
+        cl.addWidget(self.spin_warn); cl.addWidget(_arrow_btns(self.spin_warn))
         cl.addWidget(QLabel("  Alarm%:"))
         self.spin_alarm = QSpinBox()
         self.spin_alarm.setRange(10, 200); self.spin_alarm.setValue(50)
         self.spin_alarm.setFixedWidth(58)
-        cl.addWidget(self.spin_alarm)
+        self.spin_alarm.valueChanged.connect(self._do_refresh)
+        cl.addWidget(self.spin_alarm); cl.addWidget(_arrow_btns(self.spin_alarm))
+        cl.addWidget(QLabel("  RMS window:"))
+        self.spin_rms_win = QSpinBox()
+        self.spin_rms_win.setRange(3, 30); self.spin_rms_win.setValue(7)
+        self.spin_rms_win.setFixedWidth(52)
+        self.spin_rms_win.valueChanged.connect(self._do_refresh)
+        cl.addWidget(self.spin_rms_win); cl.addWidget(_arrow_btns(self.spin_rms_win))
         cl.addStretch()
         bl.addWidget(cfg_row)
 
@@ -1829,7 +2055,7 @@ class FWHMPanel(QWidget):
             "Derivative threshold for continuum column detection.\n"
             "Lower = more sensitive to spectral lines.\n"
             "Shared by all session features.")
-        fl.addWidget(self.spin_flat)
+        fl.addWidget(self.spin_flat); fl.addWidget(_arrow_btns(self.spin_flat))
         fl.addWidget(QLabel("ADU/col"))
         fl.addStretch()
         bl.addWidget(flat_row)
@@ -1837,7 +2063,8 @@ class FWHMPanel(QWidget):
         self._body.setVisible(False)
         outer.addWidget(self._body)
 
-        self._fwhm_summary = "FWHM: —"
+        self._summary = "Flux: —  Cen: —  Asym: —  RMS: —"
+        self._last_session: SessionData | None = None
 
     def _toggle(self, checked: bool):
         self._expanded = checked
@@ -1846,14 +2073,16 @@ class FWHMPanel(QWidget):
 
     def _update_header(self):
         arrow = "▼" if self._expanded else "▶"
-        self._hdr.setText(f"{arrow} Spatial FWHM Monitor  —  {self._fwhm_summary}")
+        self._hdr.setText(f"{arrow} Slit Quality  —  {self._summary}")
+
+    def _do_refresh(self):
+        if self._last_session is not None:
+            self.refresh(self._last_session)
 
     def _restyle(self):
         if _is_day_mode:
             self._hdr.setStyleSheet("")
             self._help_btn.setStyleSheet("")
-            self._lbl_fwhm.setStyleSheet("")
-            self._lbl_baseline.setStyleSheet("")
             self._flat_lbl.setStyleSheet("")
             return
         self._hdr.setStyleSheet(f"""
@@ -1865,36 +2094,47 @@ class FWHMPanel(QWidget):
             QPushButton:checked {{ color:{ACCENT}; }}
         """)
         self._help_btn.setStyleSheet(f"color:{TEXT_HI}; font-size:12pt; border:none;")
-        self._lbl_fwhm.setStyleSheet(
-            f"color:{ACCENT}; font-size:{F_VAL}; font-weight:bold; border:none;")
-        self._lbl_baseline.setStyleSheet(
-            f"color:{TEXT_DIM}; font-size:11pt; border:none;")
         self._flat_lbl.setStyleSheet(f"color:{TEXT_DIM}; font-size:10pt; border:none;")
 
     def refresh(self, session: SessionData):
-        warn  = float(self.spin_warn.value())
-        alarm = float(self.spin_alarm.value())
-        self._canvas.refresh(session, warn, alarm)
-        bl  = session.baseline_fwhm
-        inc = session.included
-        cur = next((r.fwhm_px for r in reversed(inc) if r.fwhm_px is not None), None)
-        if cur is None:
-            col = TEXT_DIM
-            fwhm_txt = "FWHM: —"
-        else:
-            if bl and cur > bl * (1 + alarm / 100):
-                col = WARN
-            elif bl and cur > bl * (1 + warn / 100):
-                col = ACCENT
-            else:
-                col = OK_COL
-            fwhm_txt = (f"FWHM: {cur:.1f} px"
-                        + ("" if inc and inc[-1].fwhm_reliable else "  (fit unreliable)"))
-        self._fwhm_summary = fwhm_txt + (f"  baseline: {bl:.1f} px" if bl else "")
-        self._lbl_fwhm.setText(fwhm_txt)
-        self._lbl_fwhm.setStyleSheet(
-            f"color:{col}; font-size:{F_VAL}; font-weight:bold; border:none;")
-        self._lbl_baseline.setText(f"baseline: {bl:.1f} px" if bl else "baseline: —")
+        self._last_session = session
+        warn    = float(self.spin_warn.value())
+        alarm   = float(self.spin_alarm.value())
+        rms_win = self.spin_rms_win.value()
+        self._canvas.refresh(
+            session,
+            show_flux      = self.cb_flux.isChecked(),
+            show_centroid  = self.cb_centroid.isChecked(),
+            show_asymmetry = self.cb_asymmetry.isChecked(),
+            show_flux_rms  = self.cb_rms.isChecked(),
+            show_fwhm      = self.cb_fwhm.isChecked(),
+            warn_pct=warn, alarm_pct=alarm, rms_window=rms_win,
+        )
+
+        # Build summary text from latest included frame
+        inc  = list(session.included)
+        last = inc[-1] if inc else None
+
+        def _f(v):
+            return f"{v/1000:.0f}k" if v is not None else "—"
+        def _c(v):
+            return f"{v:.1f} px" if v is not None else "—"
+        def _a(v):
+            return f"{v*100:+.1f}%" if v is not None else "—"
+
+        flux_str = _f(last.total_flux if last else None)
+        cen_str  = _c(last.spatial_centroid if last else None)
+        asym_str = _a(last.profile_asymmetry if last else None)
+
+        # RMS: last value from rolling computation
+        rms_str = "—"
+        all_fx = [(i, r.total_flux) for i, r in enumerate(inc) if r.total_flux is not None]
+        if len(all_fx) >= rms_win:
+            mean_f = abs(np.mean([f for _, f in all_fx])) or 1.0
+            win = [f for _, f in all_fx[-rms_win:]]
+            rms_str = f"{float(np.std(win))/mean_f*100:.1f}%"
+
+        self._summary = f"Flux: {flux_str}  Cen: {cen_str}  Asym: {asym_str}  RMS: {rms_str}"
         self._update_header()
 
 
@@ -1940,14 +2180,14 @@ class ConvergencePanel(QWidget):
         cl.setContentsMargins(0, 0, 0, 0); cl.setSpacing(8)
         cl.addWidget(QLabel("Envelope ±"))
         self.spin_sigma = QSpinBox()
-        self.spin_sigma.setRange(1, 3); self.spin_sigma.setValue(2)
+        self.spin_sigma.setRange(1, 3); self.spin_sigma.setValue(1)
         self.spin_sigma.setFixedWidth(48)
-        cl.addWidget(self.spin_sigma)
+        cl.addWidget(self.spin_sigma); cl.addWidget(_arrow_btns(self.spin_sigma))
         cl.addWidget(QLabel("σ   Persist:"))
         self.spin_persist = QDoubleSpinBox()
         self.spin_persist.setRange(0.50, 1.00); self.spin_persist.setSingleStep(0.05)
         self.spin_persist.setValue(0.70); self.spin_persist.setFixedWidth(62)
-        cl.addWidget(self.spin_persist)
+        cl.addWidget(self.spin_persist); cl.addWidget(_arrow_btns(self.spin_persist))
         cl.addStretch()
         bl.addWidget(cfg_row)
 
@@ -2040,7 +2280,7 @@ class SNRSparklinePanel(QWidget):
         self.spin_snr_tgt.setRange(0, 9999); self.spin_snr_tgt.setValue(0)
         self.spin_snr_tgt.setFixedWidth(65)
         self.spin_snr_tgt.setToolTip("0 = disabled")
-        cl.addWidget(self.spin_snr_tgt)
+        cl.addWidget(self.spin_snr_tgt); cl.addWidget(_arrow_btns(self.spin_snr_tgt))
         cl.addStretch()
         bl.addWidget(cfg_row)
 
@@ -2087,9 +2327,12 @@ class SNRSparklinePanel(QWidget):
 # ── Frame manager panel ───────────────────────────────────────────────────────
 class FrameManagerPanel(QWidget):
     recompute_requested = pyqtSignal()
-    file_selected       = pyqtSignal(str)   # full filepath when user clicks a row
+    file_selected       = pyqtSignal(str)
 
-    _COL_HEADERS = ["#", "File", "Peak ADU", "Cont SNR", "FWHM", "Status", "Include"]
+    _COL_BASE    = ["#", "File", "Peak ADU", "Cont SNR", "FWHM", "Status", "★", "Incl."]
+    _COL_HEADERS = _COL_BASE          # reference kept for index lookups
+    _COL_INCL    = 7                  # "Incl." column index
+    _COL_NOM     = 6                  # "★" nominate column index
 
     def __init__(self):
         super().__init__()
@@ -2105,8 +2348,7 @@ class FrameManagerPanel(QWidget):
             QPushButton {{
                 text-align:left; padding:4px 8px;
                 background:{DARK_PANEL}; color:{TEXT};
-                border:1px solid {DARK_BORDER}; border-radius:3px;
-                font-size:11pt;
+                border:1px solid {DARK_BORDER}; border-radius:3px; font-size:11pt;
             }}
             QPushButton:checked {{ color:{ACCENT}; }}
         """)
@@ -2116,7 +2358,7 @@ class FrameManagerPanel(QWidget):
         # ── auto-flag config row ──────────────────────────────────────────────
         self._cfg_widget = QWidget()
         cl = QHBoxLayout(self._cfg_widget)
-        cl.setContentsMargins(4, 2, 4, 2); cl.setSpacing(10)
+        cl.setContentsMargins(4, 2, 4, 2); cl.setSpacing(8)
         self.chk_snr  = QCheckBox("Low SNR")
         self.chk_fwhm = QCheckBox("High FWHM")
         self.chk_sat  = QCheckBox("Saturated")
@@ -2128,6 +2370,15 @@ class FrameManagerPanel(QWidget):
         btn_recomp.setFixedWidth(120)
         btn_recomp.clicked.connect(self.recompute_requested.emit)
         cl.addWidget(btn_recomp)
+        self.btn_nominate = QPushButton("★ Nominate OK")
+        self.btn_nominate.setFixedWidth(140)
+        self.btn_nominate.setToolTip(
+            "Step 1: auto-select all OK frames for export.\n"
+            "Step 2: copy selected (★) files to a \\nominated sub-folder.\n"
+            "You can manually toggle the ★ checkboxes between steps.")
+        self.btn_nominate.clicked.connect(self._on_nominate_clicked)
+        self._nominate_state = 0
+        cl.addWidget(self.btn_nominate)
         cl.addStretch()
         self._cfg_widget.setVisible(False)
         outer.addWidget(self._cfg_widget)
@@ -2154,52 +2405,143 @@ class FrameManagerPanel(QWidget):
         self._tbl.setSelectionBehavior(QTableWidget.SelectionBehavior.SelectRows)
         self._tbl.setEditTriggers(QTableWidget.EditTrigger.NoEditTriggers)
         self._tbl.verticalHeader().setVisible(False)
-        self._tbl.setFixedHeight(190)
+        self._tbl.setFixedHeight(200)
+        self._tbl.horizontalHeader().sectionClicked.connect(self._on_header_clicked)
         self._tbl.itemChanged.connect(self._on_item_changed)
-        self._tbl.cellClicked.connect(self._on_cell_clicked)
+        self._tbl.cellDoubleClicked.connect(self._on_cell_clicked)
         tl.addWidget(self._tbl)
         self._tbl_widget.setVisible(False)
         outer.addWidget(self._tbl_widget)
 
         self._session: SessionData | None = None
         self._updating = False
+        self._nominated: set[str] = set()
+        self._display_order: list[int] = []
+        self._sort_state: dict[int, int] = {}  # col → 0=default,1=asc,2=desc
 
+    # ─────────────────────────────────────────────────────────────────────────
     def _toggle(self, checked: bool):
         self._expanded = checked
         arrow = "▼" if checked else "▶"
-        txt = self._hdr.text()
-        self._hdr.setText(arrow + txt[1:])
+        self._hdr.setText(arrow + self._hdr.text()[1:])
         self._cfg_widget.setVisible(checked)
         self._tbl_widget.setVisible(checked)
+
+    # ── sort ─────────────────────────────────────────────────────────────────
+    def _on_header_clicked(self, col: int):
+        if self._session is None:
+            return
+        cur = self._sort_state.get(col, 0)
+        nxt = (cur + 1) % 3
+        self._sort_state = {col: nxt}
+        n = len(self._session.records)
+        self._display_order = list(range(n))
+        if nxt != 0:
+            self._apply_sort(col, nxt)
+        # Update header labels with sort indicator
+        for i, h in enumerate(self._COL_BASE):
+            self._tbl.setHorizontalHeaderItem(i, QTableWidgetItem(h))
+        if nxt == 1:
+            ind = " ▲"
+        elif nxt == 2:
+            ind = " ▼"
+        else:
+            ind = ""
+        self._tbl.setHorizontalHeaderItem(
+            col, QTableWidgetItem(self._COL_BASE[col] + ind))
+        self.refresh(self._session)
+
+    def _apply_sort(self, col: int, direction: int):
+        recs = self._session.records
+        rev  = (direction == 2)
+
+        def _none_last(val, fallback=0.0):
+            return (val is None, val if val is not None else fallback)
+
+        if   col == 0: key = lambda i: recs[i].frame_number
+        elif col == 1: key = lambda i: recs[i].filename.lower()
+        elif col == 2: key = lambda i: recs[i].peak_adu
+        elif col == 3: key = lambda i: _none_last(recs[i].continuum_snr)
+        elif col == 4: key = lambda i: _none_last(recs[i].fwhm_px)
+        elif col == 5:
+            _ord = {"included": 0, "flagged": 1, "excluded": 2}
+            key  = lambda i: _ord.get(recs[i].inclusion, 3)
+        else:
+            key = lambda i: i
+        self._display_order.sort(key=key, reverse=rev)
+
+    # ── nominate / export ─────────────────────────────────────────────────────
+    def _on_nominate_clicked(self):
+        if self._nominate_state == 0:
+            # Auto-select all OK (fully included, not flagged) frames
+            self._nominated.clear()
+            if self._session:
+                for rec in self._session.records:
+                    if rec.inclusion == "included" and rec.filepath:
+                        self._nominated.add(rec.filepath)
+            self._nominate_state = 1
+            self.btn_nominate.setText("Copy ► \\nominated")
+            if self._session:
+                self.refresh(self._session)
+        else:
+            self._do_copy_nominated()
+            self._nominate_state = 0
+            self.btn_nominate.setText("★ Nominate OK")
+            self._nominated.clear()
+            if self._session:
+                self.refresh(self._session)
+
+    def _do_copy_nominated(self):
+        paths = [Path(fp) for fp in self._nominated if fp]
+        if not paths:
+            return
+        target_dir = paths[0].parent / "nominated"
+        target_dir.mkdir(exist_ok=True)
+        for p in paths:
+            if p.exists():
+                shutil.copy2(p, target_dir / p.name)
+
+    # ── table item callbacks ──────────────────────────────────────────────────
+    def _rec_for_row(self, row: int):
+        if self._session is None:
+            return None
+        idx = self._display_order[row] if row < len(self._display_order) else row
+        if idx >= len(self._session.records):
+            return None
+        return self._session.records[idx]
 
     def _on_item_changed(self, item: QTableWidgetItem):
         if self._updating or self._session is None:
             return
-        if item.column() != self._COL_HEADERS.index("Include"):
+        col = item.column()
+        rec = self._rec_for_row(item.row())
+        if rec is None:
             return
-        row = item.row()
-        if row >= len(self._session.records):
-            return
-        rec = self._session.records[row]
-        include = item.checkState() == Qt.CheckState.Checked
-        if include:
-            if rec.inclusion == "excluded":
-                rec.inclusion = "flagged" if rec.flag_reasons else "included"
-        else:
-            if rec.inclusion == "flagged":
-                rec.user_kept = False
-            rec.inclusion = "excluded"
-        self.recompute_requested.emit()
+        if col == self._COL_NOM:
+            if item.checkState() == Qt.CheckState.Checked:
+                if rec.filepath:
+                    self._nominated.add(rec.filepath)
+            else:
+                self._nominated.discard(rec.filepath or "")
+        elif col == self._COL_INCL:
+            include = item.checkState() == Qt.CheckState.Checked
+            if include:
+                if rec.inclusion == "excluded":
+                    rec.inclusion = "flagged" if rec.flag_reasons else "included"
+            else:
+                if rec.inclusion == "flagged":
+                    rec.user_kept = False
+                rec.inclusion = "excluded"
+            self.recompute_requested.emit()
 
     def _on_cell_clicked(self, row: int, col: int):
-        if col == 6 or self._session is None or self._updating:
+        if col in (self._COL_NOM, self._COL_INCL) or self._updating:
             return
-        if row >= len(self._session.records):
-            return
-        fp = self._session.records[row].filepath
-        if fp:
-            self.file_selected.emit(fp)
+        rec = self._rec_for_row(row)
+        if rec and rec.filepath:
+            self.file_selected.emit(rec.filepath)
 
+    # ── refresh ───────────────────────────────────────────────────────────────
     def refresh(self, session: SessionData):
         self._session = session
         n_inc = session.n_included
@@ -2212,10 +2554,15 @@ class FrameManagerPanel(QWidget):
         if not self._expanded:
             return
 
+        if len(self._display_order) != n_tot:
+            self._display_order = list(range(n_tot))
+
         self._updating = True
         try:
             self._tbl.setRowCount(n_tot)
-            for row, rec in enumerate(session.records):
+            for display_row, rec_idx in enumerate(self._display_order):
+                rec = session.records[rec_idx]
+
                 def _cell(text: str, color: str = TEXT) -> QTableWidgetItem:
                     it = QTableWidgetItem(text)
                     it.setForeground(QColor(color))
@@ -2249,17 +2596,28 @@ class FrameManagerPanel(QWidget):
                     _cell(fwhm_txt),
                     _cell(st_txt, color=st_col),
                 ]
-                for col, it in enumerate(cells):
+                for ci, it in enumerate(cells):
                     it.setBackground(row_bg)
-                    self._tbl.setItem(row, col, it)
+                    self._tbl.setItem(display_row, ci, it)
 
+                # ★ Nominate checkbox (col 6)
+                nom_it = QTableWidgetItem()
+                nom_it.setFlags(Qt.ItemFlag.ItemIsEnabled | Qt.ItemFlag.ItemIsUserCheckable)
+                nom_it.setCheckState(
+                    Qt.CheckState.Checked
+                    if rec.filepath and rec.filepath in self._nominated
+                    else Qt.CheckState.Unchecked)
+                nom_it.setBackground(row_bg)
+                self._tbl.setItem(display_row, self._COL_NOM, nom_it)
+
+                # Incl. checkbox (col 7)
                 chk_it = QTableWidgetItem()
                 chk_it.setFlags(Qt.ItemFlag.ItemIsEnabled | Qt.ItemFlag.ItemIsUserCheckable)
                 chk_it.setCheckState(
                     Qt.CheckState.Checked if rec.inclusion != "excluded"
                     else Qt.CheckState.Unchecked)
                 chk_it.setBackground(row_bg)
-                self._tbl.setItem(row, 6, chk_it)
+                self._tbl.setItem(display_row, self._COL_INCL, chk_it)
 
             self._tbl.scrollToBottom()
             self._tbl.resizeColumnsToContents()
@@ -2369,6 +2727,16 @@ class LogbookWidget(QWidget):
     def flush(self):
         self._do_save()
 
+    def append_note(self, text: str):
+        """Append a line of text (e.g., region settings) and save immediately."""
+        if self._path is None:
+            return
+        self._edit.blockSignals(True)
+        cur = self._edit.toPlainText().rstrip("\n")
+        self._edit.setPlainText(cur + "\n" + text + "\n")
+        self._edit.blockSignals(False)
+        self._do_save()
+
     def _restyle(self):
         if _is_day_mode:
             self._edit.setStyleSheet("")
@@ -2448,6 +2816,7 @@ class MainWindow(QMainWindow):
         super().__init__()
         self.cfg         = load_config()
         self.fits_data   = None
+        self._rotated_data: np.ndarray | None = None
         self.watcher: FolderWatcher | None = None
         self._hold       = False
         self._busy       = False
@@ -2468,6 +2837,10 @@ class MainWindow(QMainWindow):
         self._apply_palette()
         self._build_ui()
         self._load_cfg_to_ui()
+        self._logbook_region_timer = QTimer(self)
+        self._logbook_region_timer.setSingleShot(True)
+        self._logbook_region_timer.setInterval(2000)
+        self._logbook_region_timer.timeout.connect(self._write_regions_to_logbook)
 
         if self.cfg.get("watch_folder"):
             self._start_watcher(self.cfg["watch_folder"])
@@ -2507,11 +2880,40 @@ class MainWindow(QMainWindow):
         ll.setContentsMargins(0, 0, 4, 0)
         ll.setSpacing(4)
 
-        img_grp, img_lay = section_box("Latest FITS Image", "image")
+        # Create header-row controls before section_box so they can be injected
+        _hsep1 = QFrame(); _hsep1.setFrameShape(QFrame.Shape.VLine)
+        _hsep1.setStyleSheet(f"QFrame {{ color:{DARK_BORDER}; max-width:1px; }}")
+        self.radio_latest = QRadioButton("Latest")
+        self.radio_hold   = QRadioButton("Hold")
+        self.radio_latest.setChecked(True)
+        _rgrp = QButtonGroup(self)
+        _rgrp.addButton(self.radio_latest)
+        _rgrp.addButton(self.radio_hold)
+        self.radio_latest.toggled.connect(self._on_view_mode_changed)
+        _hsep2 = QFrame(); _hsep2.setFrameShape(QFrame.Shape.VLine)
+        _hsep2.setStyleSheet(f"QFrame {{ color:{DARK_BORDER}; max-width:1px; }}")
+        self.btn_theme = QPushButton("Day Mode")
+        self.btn_theme.setCheckable(True)
+        self.btn_theme.setFixedWidth(110)
+        self.btn_theme.setToolTip(
+            "Switch between night-vision (red) and day (blue) colour schemes")
+        self.btn_theme.toggled.connect(self._on_theme_toggle)
+        self._header_seps = [_hsep1, _hsep2]
+
+        img_grp, img_lay = section_box(
+            "Latest FITS Image", "image",
+            header_extra=[_hsep1, self.radio_latest, self.radio_hold,
+                          _hsep2, self.btn_theme])
+        self._img_title_lbl = _section_titles[-1]  # capture for Hold/Latest rename
         self.img_canvas = ImageCanvas()
         self.img_canvas.line_released.connect(self._on_lines_released)
         self.img_canvas.zoom_x_changed.connect(self._on_zoom_x_changed)
         self.img_canvas.zoom_reset_sig.connect(self._on_zoom_reset_sync)
+        self.lbl_filename = QLabel("No file loaded")
+        self.lbl_filename.setAlignment(Qt.AlignmentFlag.AlignCenter)
+        self.lbl_filename.setStyleSheet(
+            f"color:{ACCENT}; font-size:{F_SM}; border:none;")
+        img_lay.addWidget(self.lbl_filename)
         img_lay.addWidget(self.img_canvas)
         ll.addWidget(img_grp, stretch=1)
 
@@ -2534,7 +2936,7 @@ class MainWindow(QMainWindow):
         tl.addWidget(self.btn_zoom)
         tl.addWidget(self.btn_reset_zoom)
         stretch_lbl = QLabel("Stretch:")
-        stretch_lbl.setStyleSheet(f"color:{TEXT_DIM}; font-size:10pt; border:none;")
+        stretch_lbl.setStyleSheet(f"color:{ACCENT}; font-size:{F_BASE}; border:none;")
         self._stretch_lbl = stretch_lbl
         tl.addWidget(stretch_lbl)
         self.stretch_slider = QSlider(Qt.Orientation.Horizontal)
@@ -2542,6 +2944,32 @@ class MainWindow(QMainWindow):
         self.stretch_slider.setFixedWidth(90)
         self.stretch_slider.valueChanged.connect(self._on_stretch)
         tl.addWidget(self.stretch_slider)
+
+        rot_sep = QFrame()
+        rot_sep.setFrameShape(QFrame.Shape.VLine)
+        rot_sep.setStyleSheet(f"QFrame {{ color:{DARK_BORDER}; max-width:1px; }}")
+        self._rot_sep = rot_sep
+        tl.addWidget(rot_sep)
+
+        rot_lbl = QLabel("Rotate°:")
+        rot_lbl.setStyleSheet(f"color:{ACCENT}; font-size:{F_BASE}; border:none;")
+        self._rot_lbl = rot_lbl
+        tl.addWidget(rot_lbl)
+
+        self.spin_rotate = QDoubleSpinBox()
+        self.spin_rotate.setRange(-5.0, 5.0)
+        self.spin_rotate.setDecimals(3)
+        self.spin_rotate.setSingleStep(0.1)
+        self.spin_rotate.setValue(self.cfg.get("rotation_angle", 0.0))
+        self.spin_rotate.setFixedWidth(90)
+        self.spin_rotate.setToolTip(
+            "Rotate image ±5° to align spectral trace with extraction bands.\n"
+            "Arrow keys: ±0.01°  |  Manual entry: any precision down to 0.001°\n"
+            "Uses bicubic spline interpolation (scipy order=3, reflect borders).")
+        self.spin_rotate.valueChanged.connect(self._on_rotate_changed)
+        tl.addWidget(self.spin_rotate)
+        tl.addWidget(_arrow_btns(self.spin_rotate))
+
         tl.addStretch()
         reg_lay.addWidget(toolbar)
 
@@ -2645,68 +3073,48 @@ class MainWindow(QMainWindow):
         self.btn_step.setEnabled(bool(self.cfg.get("watch_folder")))
 
         self.lbl_folder = QLabel("No folder selected")
-        self.lbl_folder.setStyleSheet(f"color:{TEXT_DIM}; font-size:{F_SM};")
+        self.lbl_folder.setStyleSheet(f"color:{ACCENT}; font-size:{F_SM};")
         self.lbl_folder.setSizePolicy(
             QSizePolicy.Policy.Expanding, QSizePolicy.Policy.Preferred)
 
-        sep1 = QFrame()
-        sep1.setFrameShape(QFrame.Shape.VLine)
-        sep1.setStyleSheet(f"QFrame {{ color:{DARK_BORDER}; max-width:1px; }}")
+        self.lbl_fileinfo = QLabel("")
+        self.lbl_fileinfo.setStyleSheet(f"color:{TEXT_DIM}; font-size:{F_SM};")
 
-        sci_lbl = QLabel("Science Image:")
-        sci_lbl.setStyleSheet(f"color:{TEXT_DIM}; font-size:11pt;")
-        self._sci_lbl = sci_lbl
-        self.radio_latest = QRadioButton("Display Latest")
-        self.radio_hold   = QRadioButton("Keep Current")
-        self.radio_latest.setChecked(True)
-        grp = QButtonGroup(self)
-        grp.addButton(self.radio_latest)
-        grp.addButton(self.radio_hold)
-        self.radio_latest.toggled.connect(
-            lambda chk: setattr(self, "_hold", not chk))
+        filter_lbl = QLabel("Filter:")
+        filter_lbl.setStyleSheet(f"color:{ACCENT}; font-size:{F_BASE}; border:none;")
+        self._filter_lbl = filter_lbl
+        self.txt_filter = QLineEdit()
+        self.txt_filter.setPlaceholderText("*alfCyg*")
+        self.txt_filter.setFixedWidth(150)
+        self.txt_filter.setToolTip(
+            "Filename glob filter — only FITS files whose names match this pattern are shown.\n"
+            "Examples: *alfCyg*   betPer_*.fits   Leave blank to match all files.")
+        self.txt_filter.textChanged.connect(self._on_filter_changed)
 
-        sep2 = QFrame()
-        sep2.setFrameShape(QFrame.Shape.VLine)
-        sep2.setStyleSheet(f"QFrame {{ color:{DARK_BORDER}; max-width:1px; }}")
+        self._vline_seps = []
 
-        self.btn_gain = QPushButton("Gain Advice: OFF")
-        self._vline_seps = [sep1, sep2]
-        self.btn_gain.setCheckable(True)
-        self.btn_gain.setChecked(self._gain_on)
-        self.btn_gain.setFixedWidth(190)
-        self.btn_gain.toggled.connect(self._on_gain_toggle)
-        self._update_gain_btn_label()
+        # File count label — right of filter box, bright ACCENT colour
+        self.lbl_count = QLabel("")
+        self.lbl_count.setStyleSheet(f"color:{ACCENT}; font-size:{F_SM};")
 
-        sep3 = QFrame()
-        sep3.setFrameShape(QFrame.Shape.VLine)
-        sep3.setStyleSheet(f"QFrame {{ color:{DARK_BORDER}; max-width:1px; }}")
-        self._vline_seps.append(sep3)
-
-        self.btn_theme = QPushButton("Day Mode")
-        self.btn_theme.setCheckable(True)
-        self.btn_theme.setFixedWidth(110)
-        self.btn_theme.setToolTip("Switch between night-vision (red) and day (blue) colour schemes")
-        self.btn_theme.toggled.connect(self._on_theme_toggle)
-
-        for w in (self.btn_folder, self.btn_step, self.lbl_folder, sep1,
-                  sci_lbl, self.radio_latest, self.radio_hold, sep2,
-                  self.btn_gain, sep3, self.btn_theme):
+        for w in (self.btn_folder, self.btn_step, self.lbl_folder,
+                  self.lbl_fileinfo, filter_lbl, self.txt_filter, self.lbl_count):
             bl.addWidget(w)
 
         rl.addWidget(bottom)
 
-        # ── Status bar ────────────────────────────────────────────────────────
+        # Wire the Gain Advice button created inside AdvisoryPanel
+        self.btn_gain = self.advisory.btn_gain
+        self.btn_gain.setChecked(self._gain_on)
+        self.btn_gain.toggled.connect(self._on_gain_toggle)
+        self._update_gain_btn_label()
+
+        # ── Status bar (errors / transient messages only) ──────────────────────
         sb = QStatusBar()
         self.setStatusBar(sb)
-        self.sb_file  = QLabel("No file loaded")
-        self.sb_info  = QLabel("")
-        self.sb_count = QLabel("")
+        self.sb_file = QLabel("")
         self.sb_file.setStyleSheet(f"font-size:{F_SM};")
-        self.sb_info.setStyleSheet(f"color:{TEXT_DIM}; font-size:{F_SM};")
-        self.sb_count.setStyleSheet(f"color:{TEXT_DIM}; font-size:{F_SM};")
-        sb.addWidget(self.sb_file, 2)
-        sb.addWidget(self.sb_info, 2)
-        sb.addPermanentWidget(self.sb_count)
+        sb.addWidget(self.sb_file, 1)
 
     @staticmethod
     def _file_info_text(d: dict) -> str:
@@ -2731,6 +3139,8 @@ class MainWindow(QMainWindow):
         self.chk_snr.setChecked(self.cfg.get("show_snr", True))
         if self.cfg.get("watch_folder"):
             self.lbl_folder.setText(self.cfg["watch_folder"])
+        self.txt_filter.setText(self.cfg.get("file_filter", ""))
+        self.spin_rotate.setValue(self.cfg.get("rotation_angle", 0.0))
 
     def _ui_to_cfg(self):
         self.cfg["target_y_start"],   self.cfg["target_y_end"]   = \
@@ -2756,6 +3166,16 @@ class MainWindow(QMainWindow):
         self.cfg["normalize_spectrum"] = self.chk_norm.isChecked()
         self.cfg["show_snr"]           = self.chk_snr.isChecked()
 
+    def _fmt_count(self) -> str:
+        """Return 'N/T file(s)' where N=filtered count, T=total FITS in folder."""
+        if not self.watcher:
+            return ""
+        n = self.watcher.count()
+        t = self.watcher.total_count()
+        if self.cfg.get("file_filter", "") and n != t:
+            return f"{n}/{t} file(s)"
+        return f"{t} file(s)"
+
     def _update_gain_btn_label(self):
         on = self.btn_gain.isChecked()
         self.btn_gain.setText(f"Gain Advice: {'ON' if on else 'OFF'}")
@@ -2771,6 +3191,17 @@ class MainWindow(QMainWindow):
             self.btn_step.setEnabled(True)
             self._start_watcher(folder)
 
+    def _on_filter_changed(self, pattern: str):
+        self.cfg["file_filter"] = pattern
+        save_config(self.cfg)
+        if self.watcher:
+            self.watcher.apply_filter(pattern)
+            self.lbl_count.setText(self._fmt_count())
+            if self.watcher.latest():
+                self._load_file(self.watcher.latest())
+            else:
+                self._clear_display()
+
     def _start_watcher(self, folder):
         if self.watcher:
             self.watcher.stop()
@@ -2781,10 +3212,11 @@ class MainWindow(QMainWindow):
         self._last_cont_mask   = None
 
         self.watcher = FolderWatcher(
-            folder, self.cfg.get("poll_interval_ms", 2000))
+            folder, self.cfg.get("poll_interval_ms", 2000),
+            self.cfg.get("file_filter", ""))
         self.watcher.new_file_found.connect(self._on_new_file)
         self.watcher.start()
-        self.sb_count.setText(f"{self.watcher.count()} file(s)")
+        self.lbl_count.setText(self._fmt_count())
 
         if self.watcher.latest():
             self._load_file(self.watcher.latest())
@@ -2793,14 +3225,16 @@ class MainWindow(QMainWindow):
 
     def _clear_display(self):
         """Reset all panels to empty state (no FITS data)."""
-        self.fits_data  = None
-        self._spec      = None
+        self.fits_data      = None
+        self._rotated_data  = None
+        self._spec          = None
         self._bg        = None
         self._n_target  = 1
         self._cur_file  = ""
         self.setWindowTitle("Spectro Inspector")
-        self.sb_file.setText("No file loaded")
-        self.sb_info.setText("")
+        self.sb_file.setText("")
+        self.lbl_filename.setText("No file loaded")
+        self.lbl_fileinfo.setText("")
         self._refresh_all()
         self.session_monitor.refresh_all(self.session_data, self._last_cont_mask)
 
@@ -2836,6 +3270,9 @@ class MainWindow(QMainWindow):
                 if key not in seen:
                     seen.add(key)
                     files.append(f)
+        filter_pat = self.cfg.get("file_filter", "")
+        if filter_pat:
+            files = [f for f in files if fnmatch.fnmatch(f.name, filter_pat)]
         files.sort(key=lambda f: f.stat().st_mtime)
 
         if not files:
@@ -2862,7 +3299,7 @@ class MainWindow(QMainWindow):
         path = self._step_files[self._step_idx]
         self._step_idx += 1
         total = len(self._step_files)
-        self.sb_count.setText(f"Stepping: {self._step_idx} / {total}")
+        self.lbl_count.setText(f"Stepping: {self._step_idx} / {total}")
         self._load_file(path)
 
         if self._step_idx < total:
@@ -2882,7 +3319,7 @@ class MainWindow(QMainWindow):
                 folder, self.cfg.get("poll_interval_ms", 2000))
             self.watcher.new_file_found.connect(self._on_new_file)
             self.watcher.start()
-            self.sb_count.setText(f"{self.watcher.count()} file(s) — live")
+            self.lbl_count.setText(self._fmt_count() + " — live")
 
     def _stop_step_through(self):
         if self._step_timer:
@@ -2891,7 +3328,7 @@ class MainWindow(QMainWindow):
 
     def _on_new_file(self, path):
         if self.watcher:
-            self.sb_count.setText(f"{self.watcher.count()} file(s)")
+            self.lbl_count.setText(self._fmt_count())
         if not self._hold:
             self._load_file(path)
 
@@ -2916,11 +3353,31 @@ class MainWindow(QMainWindow):
         if obj and folder:
             self.logbook.set_target(folder, obj)
 
+        self._apply_rotation()
         self._refresh_all()
         self._process_session_frame()
 
-        self.sb_file.setText(d["filename"])
-        self.sb_info.setText(self._file_info_text(d))
+        self.sb_file.setText("")
+        self.lbl_filename.setText(d["filename"])
+        self.lbl_fileinfo.setText(self._file_info_text(d))
+
+    # ── rotation ─────────────────────────────────────────────────────────────
+    def _apply_rotation(self):
+        if self.fits_data is None:
+            self._rotated_data = None
+            return
+        angle = self.cfg.get("rotation_angle", 0.0)
+        self._rotated_data = rotate_image(self.fits_data["data"], angle)
+
+    def _effective_fits(self) -> dict | None:
+        """Return fits_data with 'data' replaced by the cached rotated array."""
+        if self.fits_data is None:
+            return None
+        if self._rotated_data is not None:
+            d = dict(self.fits_data)
+            d["data"] = self._rotated_data
+            return d
+        return self.fits_data
 
     # ── refresh ───────────────────────────────────────────────────────────────
     def _refresh_all(self):
@@ -2928,23 +3385,34 @@ class MainWindow(QMainWindow):
         self._busy = True
         try:
             self._ui_to_cfg()
-            self.img_canvas.refresh(self.fits_data, self.cfg, self.stretch_slider.value())
+            self.img_canvas.refresh(self._effective_fits(), self.cfg, self.stretch_slider.value())
             self._refresh_spec_advisory()
         finally:
             self._busy = False
 
     def _refresh_spec_advisory(self):
         res = self.spec_canvas.refresh(
-            self.fits_data, self.cfg,
+            self._effective_fits(), self.cfg,
             self.chk_snr.isChecked(), self.chk_norm.isChecked())
         if res is not None:
             _, self._spec, self._bg, self._n_target = res
         self.advisory.refresh_data(
-            self.fits_data, self.cfg,
+            self._effective_fits(), self.cfg,
             self._spec, self._bg, self._n_target,
             gain_on=self._gain_on)
 
     # ── signal handlers ───────────────────────────────────────────────────────
+    def _on_view_mode_changed(self, latest: bool):
+        self._hold = not latest
+        self._img_title_lbl.setText(
+            "Latest FITS Image" if latest else "HOLD FITS Image")
+
+    def _on_rotate_changed(self, value: float):
+        self.cfg["rotation_angle"] = round(value, 4)
+        save_config(self.cfg)
+        self._apply_rotation()
+        self._refresh_all()
+
     def _on_lines_released(self):
         self._cfg_from_canvas()
         self._spinboxes_from_canvas()
@@ -2955,11 +3423,20 @@ class MainWindow(QMainWindow):
         self._ui_to_cfg()
         save_config(self.cfg)
         self._refresh_all()
+        self._logbook_region_timer.start()
+
+    def _write_regions_to_logbook(self):
+        c = self.cfg
+        self.logbook.append_note(
+            f"[regions] TARGET y {c['target_y_start']}–{c['target_y_end']}  "
+            f"BG_ABOVE y {c['bg_above_y_start']}–{c['bg_above_y_end']}  "
+            f"BG_BELOW y {c['bg_below_y_start']}–{c['bg_below_y_end']}"
+        )
 
     def _on_stretch(self):
         self._ui_to_cfg()
         save_config(self.cfg)
-        self.img_canvas.refresh(self.fits_data, self.cfg, self.stretch_slider.value())
+        self.img_canvas.refresh(self._effective_fits(), self.cfg, self.stretch_slider.value())
 
     def _on_options(self):
         self._ui_to_cfg()
@@ -2994,7 +3471,7 @@ class MainWindow(QMainWindow):
         if self.fits_data is None or self._spec is None:
             return
         cfg  = self.cfg
-        data = self.fits_data["data"]
+        data = self._rotated_data if self._rotated_data is not None else self.fits_data["data"]
         spec = self._spec
 
         # Flatness mask — shared filter
@@ -3012,6 +3489,7 @@ class MainWindow(QMainWindow):
         y0_prof = cfg.get("bg_above_y_start", 0)
         y1_prof = cfg.get("bg_below_y_end", data.shape[0])
         fwhm, _centroid, reliable = None, None, False
+        spatial = None
         if n_cont >= 10:
             spatial = _spatial_profile_from_continuum(data, cont_mask, y0_prof, y1_prof)
             if spatial is not None:
@@ -3019,6 +3497,17 @@ class MainWindow(QMainWindow):
                     spatial,
                     residual_threshold=cfg.get("gaussian_residual_thresh", 0.30),
                 )
+
+        # New slit-quality metrics
+        spatial_centroid = _centroid
+        profile_asymmetry = None
+        if spatial is not None and _centroid is not None:
+            ci    = max(1, min(int(round(float(_centroid))), len(spatial) - 1))
+            above = float(np.sum(spatial[:ci]))
+            below = float(np.sum(spatial[ci:]))
+            denom = above + below
+            profile_asymmetry = (above - below) / denom if denom > 0 else None
+        total_flux = float(np.sum(spec)) if spec is not None else None
 
         # Per-frame continuum SNR (from existing SNR array, averaged over cont cols)
         cont_snr = None
@@ -3042,9 +3531,12 @@ class MainWindow(QMainWindow):
             peak_adu      = peak,
             sat_limit     = slmt,
             continuum_snr = cont_snr,
-            fwhm_px       = fwhm,
-            fwhm_reliable = reliable,
-            n_continuum   = n_cont,
+            fwhm_px           = fwhm,
+            fwhm_reliable     = reliable,
+            n_continuum       = n_cont,
+            spatial_centroid  = spatial_centroid,
+            profile_asymmetry = profile_asymmetry,
+            total_flux        = total_flux,
         )
 
         # Merge autoflag cfg from frame manager UI
@@ -3063,9 +3555,9 @@ class MainWindow(QMainWindow):
         self.session_monitor.refresh_all(self.session_data, self._last_cont_mask)
 
     def _on_frame_selected(self, path: str):
-        """Frame Manager row click — show that frame only when in Keep Current mode."""
-        if self._hold:
-            self._display_file_only(path)
+        """Frame Manager double-click — switch to Hold mode and display that frame."""
+        self.radio_hold.setChecked(True)   # sets self._hold = True via signal
+        self._display_file_only(path)
 
     def _display_file_only(self, path: str):
         """Load a FITS file for display without creating a new session record."""
@@ -3078,9 +3570,11 @@ class MainWindow(QMainWindow):
             e_adu, rn_cam, _ = interp_gain(float(gs))
             self.cfg["conversion_gain"] = round(e_adu, 4)
             self.cfg["read_noise"]      = round(rn_cam, 2)
+        self._apply_rotation()
         self._refresh_all()
-        self.sb_file.setText(f"[viewing] {d['filename']}")
-        self.sb_info.setText(self._file_info_text(d))
+        self.sb_file.setText("")
+        self.lbl_filename.setText(f"[viewing] {d['filename']}")
+        self.lbl_fileinfo.setText(self._file_info_text(d))
 
     def _on_theme_toggle(self, day: bool):
         self.btn_theme.setText("Night Mode" if day else "Day Mode")
@@ -3120,22 +3614,29 @@ class MainWindow(QMainWindow):
         for sep in self._vline_seps:
             sep.setStyleSheet(
                 "" if day else f"QFrame {{ color:{DARK_BORDER}; max-width:1px; }}")
+        for sep in self._header_seps:
+            sep.setStyleSheet(
+                "" if day else f"QFrame {{ color:{DARK_BORDER}; max-width:1px; }}")
         self.lbl_folder.setStyleSheet(
-            "" if day else f"color:{TEXT_DIM}; font-size:{F_SM};")
-        self._sci_lbl.setStyleSheet(
-            "" if day else f"color:{TEXT_DIM}; font-size:11pt;")
+            "" if day else f"color:{ACCENT}; font-size:{F_SM};")
+        self.lbl_filename.setStyleSheet(
+            "" if day else f"color:{ACCENT}; font-size:{F_SM}; border:none;")
+        self._filter_lbl.setStyleSheet(
+            "" if day else f"color:{ACCENT}; font-size:{F_BASE}; border:none;")
 
-        # Stretch label
+        # Stretch label + rotate label/separator
         self._stretch_lbl.setStyleSheet(
-            "" if day else f"color:{TEXT_DIM}; font-size:10pt; border:none;")
+            "" if day else f"color:{ACCENT}; font-size:{F_BASE}; border:none;")
+        self._rot_lbl.setStyleSheet(
+            "" if day else f"color:{ACCENT}; font-size:{F_BASE}; border:none;")
+        self._rot_sep.setStyleSheet(
+            "" if day else f"QFrame {{ color:{DARK_BORDER}; max-width:1px; }}")
 
-        # Status bar labels
-        self.sb_file.setStyleSheet(
-            "" if day else f"font-size:{F_SM};")
-        self.sb_info.setStyleSheet(
+        # Bottom bar file info + count label
+        self.lbl_fileinfo.setStyleSheet(
             "" if day else f"color:{TEXT_DIM}; font-size:{F_SM};")
-        self.sb_count.setStyleSheet(
-            "" if day else f"color:{TEXT_DIM}; font-size:{F_SM};")
+        self.lbl_count.setStyleSheet(
+            "" if day else f"color:{ACCENT}; font-size:{F_SM};")
 
         # Tab widget
         self._tabs_widget.setStyleSheet(
@@ -3148,9 +3649,14 @@ class MainWindow(QMainWindow):
             QTabBar::tab:hover    {{ background:{NIGHT_PALETTE["_SEL_BG"]}; }}
         """)
 
-        # Region controls (dot/label inline styles)
+        # Region controls (dot/label + arrow buttons)
         for ctrl in (self.ctrl_target, self.ctrl_bg_above, self.ctrl_bg_below):
             ctrl._restyle()
+        # All ▲/▼ spinbox arrow buttons (registered globally by _arrow_btns())
+        _ab_sty = (f"font-size:9pt; padding:0px; color:{DARK_BG}; "
+                   f"background:{TEXT_HI}; border:1px solid {DARK_BORDER};")
+        for btn in _arrow_btns_list:
+            btn.setStyleSheet("" if day else _ab_sty)
 
         # Session monitor scroll area and panels
         self.session_monitor._restyle()
@@ -3190,7 +3696,16 @@ class MainWindow(QMainWindow):
 
 
 # ── Entry point ────────────────────────────────────────────────────────────────
+def _qt_msg_handler(mode, context, message):
+    """Suppress noisy Qt startup warnings (e.g. cursor-position before window shown)."""
+    if "cursor position" in message.lower():
+        return
+    import sys as _sys
+    print(message, file=_sys.stderr)
+
 def main():
+    from PyQt6.QtCore import qInstallMessageHandler
+    qInstallMessageHandler(_qt_msg_handler)
     app = QApplication(sys.argv)
     app.setStyle("Fusion")
     app.setFont(QFont("Segoe UI", 11))

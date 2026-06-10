@@ -12,7 +12,7 @@ Or double-click `run.bat` on Windows.
 
 Install dependencies (first time only):
 ```
-pip install astropy numpy matplotlib PyQt6
+pip install astropy>=6.0 numpy>=2.0 matplotlib>=3.9 PyQt6>=6.7 scipy>=1.13
 ```
 Or run `install.bat`.
 
@@ -20,9 +20,9 @@ There are no tests or linting configs in this project.
 
 ## Architecture
 
-Everything lives in a single file: `spectro_tool.py` (~2100 lines). No packages, no modules.
+Everything lives in a single file: `spectro_tool.py` (~4950 lines). No packages, no modules.
 
-The file ends at line 1532 with `if __name__ == "__main__": main()`.
+The entry point is `if __name__ == "__main__": main()` at the end of the file.
 
 ### Key classes
 
@@ -30,22 +30,40 @@ The file ends at line 1532 with `if __name__ == "__main__": main()`.
 |---|---|
 | `FolderWatcher(QThread)` | Polls a directory for new `.fits`/`.fit` files every N ms; emits `new_file_found` signal |
 | `ImageCanvas(FigureCanvas)` | Displays the 2D FITS spectrum image with draggable region boundary handles and rubber-band zoom |
-| `SpectrumCanvas(FigureCanvas)` | Plots the extracted 1D spectrum and optional SNR curve |
+| `SpectrumCanvas(FigureCanvas)` | Plots the hot-pixel-filtered peak ADU per column, sky background, and linearity limit |
 | `AdvisoryPanel(QWidget)` | Computed advisory text: peak fill, SNR, noise regime, exposure suggestion, gain advice |
 | `RegionControl(QWidget)` | Paired spinboxes for editing a target or background Y-range |
+| `WelfordStats` | Per-column running mean/variance using Welford's numerically stable online algorithm |
+| `FrameRecord` | Dataclass holding per-frame metrics (peak ADU, SNR, FWHM, centroid, inclusion state) |
+| `SessionData` | Accumulates all `FrameRecord` entries and drives Welford statistics + persistence tracking |
+| `SessionMetricsCanvas(FigureCanvas)` | Slit-quality metrics chart (flux, centroid, asymmetry, RMS) |
+| `ConvergenceProfileCanvas(FigureCanvas)` | Running-mean spectrum with ±σ/√N confidence envelope |
+| `SNRSparklineCanvas(FigureCanvas)` | Continuum SNR vs frame number sparkline |
+| `FrameManagerPanel(QWidget)` | Sortable per-frame table with auto-flagging, inclusion toggles, and export |
+| `SessionMonitorWidget(QWidget)` | Container for the Session Monitor tab; owns all session-display sub-panels |
+| `WavelengthCalibration` | Dataclass for a polynomial calibration result (not yet exposed in UI) |
+| `CalibrationTab(QWidget)` | Wavelength calibration workflow (code present, tab not added to UI — work in progress) |
+| `LogbookWidget(QWidget)` | Auto-saving per-target text notepad; writes `logbook_<Target>.txt` in the watch folder |
 | `MainWindow(QMainWindow)` | Orchestrates all panels; owns config, watcher, and all signal→slot wiring |
 
 ### Data flow
 
 1. `FolderWatcher` detects a new FITS file → `MainWindow._load_file()` → `load_fits()` returns a dict with `data` (float32 array), FITS header fields, and camera metadata.
-2. `MainWindow._refresh_all()` pushes the data through `ImageCanvas.refresh()` and `SpectrumCanvas.refresh()`.
-3. `SpectrumCanvas.refresh()` calls `extract_spectrum()` and `compute_snr()`, returns `(x, spec, bg, n_target)`.
+2. `MainWindow._refresh_all()` pushes data through `ImageCanvas.refresh()` and `SpectrumCanvas.refresh()`.
+3. `SpectrumCanvas.refresh()` calls `extract_spectrum()`, computes the hot-pixel-filtered column max, and returns `(x, spec, bg, n_target)`.
 4. `AdvisoryPanel.refresh_data()` consumes those results to compute and display the text advisories.
-5. Any UI interaction (drag handles, spinboxes, checkboxes, slider) calls `save_config()` and triggers the appropriate refresh path.
+5. Each new frame also creates a `FrameRecord` and calls `SessionData.add_frame()`, which updates Welford statistics incrementally.
+6. Any UI interaction (drag handles, spinboxes, checkboxes, slider) calls `save_config()` and triggers the appropriate refresh path.
 
 ### Config
 
 `spectro_config.json` is written next to `spectro_tool.py` and is auto-saved on every UI change. `load_config()` merges stored values with `DEFAULTS` so missing keys are always back-filled. The `conversion_gain` and `read_noise` keys are overwritten automatically on each file load using the FITS `GAIN` header value looked up in `ASI585_TABLE`.
+
+### Calibration tab (work in progress — not in UI)
+
+`CalibrationTab` and its supporting classes (`CalibrationImageCanvas`, `CalibrationSpectrumCanvas`, `CalibrationResidualsCanvas`) exist in the source but the tab is **not added to the UI**. Do not expose it until it is complete.
+
+The lamp line database (`LAMP_LINES`) supports: Ne glowlamp, NeXe (Philips S10), ArH (Osram ST111), NeArHe (Relco SC480).
 
 ## Camera-specific physics
 
@@ -65,4 +83,8 @@ where G = conversion gain (e⁻/16-bit ADU), R = read noise (e⁻), N = number o
 
 ## Night-vision palette
 
-All colours are defined in module-level constants (`DARK_BG`, `TEXT`, `ACCENT`, etc.) as hex strings. The entire UI is red-channel-only so it remains usable through a red astronomy filter. Do not introduce green or blue UI elements.
+Two palettes are defined at module level: `NIGHT_PALETTE` (red-channel-only) and `DAY_PALETTE` (standard blue/grey). The active palette is mirrored into bare-name globals (`DARK_BG`, `TEXT`, `ACCENT`, etc.) by `_apply_palette_vars()`. `make_style()` regenerates the Qt stylesheet from these globals; call it and re-apply whenever the palette switches.
+
+**Do not introduce green or blue UI elements** in night mode — all colours must be distinguishable by red-channel brightness only so the UI remains usable through a red astronomy filter.
+
+When adding new UI widgets, register them in `_section_titles`, `_section_boxes`, `_section_seps`, or `_arrow_btns_list` if they need palette-aware recolouring on theme switch.

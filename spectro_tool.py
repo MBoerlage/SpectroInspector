@@ -16,7 +16,10 @@ from pathlib import Path
 from dataclasses import dataclass, field
 
 import numpy as np
+from datetime import datetime
 from scipy.ndimage import rotate
+from scipy.signal import find_peaks
+from scipy.optimize import curve_fit, minimize
 
 try:
     from astropy.io import fits as pyfits
@@ -32,6 +35,7 @@ try:
         QFileDialog, QStatusBar, QSizePolicy, QFrame,
         QTabWidget, QTableWidget, QTableWidgetItem, QPlainTextEdit,
         QScrollArea, QLineEdit, QAbstractSpinBox,
+        QComboBox, QListWidget,
     )
     from PyQt6.QtCore import Qt, QThread, pyqtSignal, QPoint, QTimer
     from PyQt6.QtGui import QPalette, QColor, QCursor, QFont
@@ -45,6 +49,7 @@ try:
     from matplotlib.figure import Figure
     from matplotlib.patches import Rectangle
     from matplotlib.ticker import FuncFormatter, MaxNLocator
+    from matplotlib.widgets import SpanSelector
 except ImportError:
     print("ERROR: matplotlib not found.  Run:  pip install matplotlib"); sys.exit(1)
 
@@ -203,6 +208,62 @@ def interp_gain(gain_slider: float) -> tuple[float, float, float]:
     return seg[-1][1], seg[-1][2], seg[-1][3]
 
 
+# ── Lamp line database ─────────────────────────────────────────────────────────
+LAMP_LINES: dict = {
+    "Ne": {
+        "label": "Ne — Glowlamp  ⚠ red-only",
+        "lines": [
+            ("Ne", 5852.48), ("Ne", 6143.06), ("Ne", 6402.25),
+            ("Ne", 6678.28), ("Ne", 6929.47), ("Ne", 7032.41),
+            ("Ne", 7245.17), ("Ne", 7438.90),
+        ],
+        "warn": "Ne only: no lines below 5852 Å — blue end uncalibrated",
+    },
+    "NeXe": {
+        "label": "NeXe — Phillips S10",
+        "lines": [
+            ("Xe", 4213.72), ("Xe", 4843.29), ("Xe", 4916.51),
+            ("Xe", 5401.00), ("Ne", 5852.48), ("Ne", 6270.82),
+            ("Ne", 6402.25), ("Xe", 6512.83), ("Ne", 6678.28),
+            ("Ne", 6929.47), ("Ne", 7032.41), ("Xe", 7119.60),
+            ("Ne", 7245.17),
+        ],
+        "warn": None,
+    },
+    "ArH": {
+        "label": "ArH — Osram ST111",
+        "lines": [
+            ("Ar", 4200.67), ("Ar", 4764.87), ("H",  4861.33),
+            ("H",  6562.80), ("Ar", 6677.28), ("Ar", 6965.43),
+            ("Ar", 7383.98), ("Ar", 7635.11),
+        ],
+        "warn": None,
+    },
+    "NeArHe": {
+        "label": "NeArHe — Relco SC480",
+        "lines": [
+            ("Ar", 4200.67), ("Ar", 4764.87), ("Ne", 5852.48),
+            ("Ne", 6143.06), ("Ne", 6402.25), ("Ar", 6677.28),
+            ("Ar", 6965.43), ("Ar", 7147.04), ("Ar", 7383.98),
+            ("Ar", 7635.11),
+        ],
+        "warn": None,
+    },
+}
+
+STELLAR_LINES: list = [
+    ("Hγ",   4340.47),
+    ("Hβ",   4861.33),
+    ("He I", 5875.61),
+    ("Hα",   6562.80),
+    ("He I", 6678.15),
+    ("He I", 7065.19),
+]
+
+WAVE_MIN_DEFAULT = 3500.0
+WAVE_MAX_DEFAULT = 8000.0
+
+
 # ── Help texts (HTML) ──────────────────────────────────────────────────────────
 HELP = {
 
@@ -236,32 +297,22 @@ slit alignment.
 
 "spectrum": """
 <b>Extracted 1D Spectrum</b><br><br>
-<b>X axis</b>: pixel column — proportional to wavelength (not calibrated).<br>
-<b>Y axis</b>: intensity in ADU × rows (k = thousands, M = millions), or
-normalised to peak = 1 if "Normalize" is checked.<br><br>
-• <b>Amber line</b>: background-subtracted spectrum
-  = Σ(target rows) − mean_bg_per_row × N_target_rows<br>
-• <b>Dim line</b>: raw TARGET sum before subtraction<br>
-• <b>Dashed red line</b>: saturation limit — the sum value if any pixel in
-  the TARGET box reached the saturation threshold<br>
-• <b>Red shading</b>: column runs where at least one TARGET pixel is saturated
-""",
-
-"snr": """
-<b>Signal-to-Noise Ratio  (right axis, dotted line)</b><br><br>
-SNR is calculated per wavelength column using the photon + sky + read-noise
-model:<br><br>
-&nbsp;&nbsp;signal_e = spectrum × G<br>
-&nbsp;&nbsp;noise_e = √( signal_e + N × (bg_per_row × G + R²) )<br>
-&nbsp;&nbsp;SNR = signal_e / noise_e<br><br>
-where G = conversion gain (e⁻/16-bit ADU), R = read noise (e⁻),
-N = number of TARGET rows.<br><br>
-<b>Interpretation</b>: SNR 100 → 1% measurement uncertainty on a spectral
-feature. Aim for SNR &gt; 50 for faint lines. Peak SNR is at the wavelength
-of maximum stellar flux.<br><br>
-<b>Important</b>: G is the 16-bit FITS gain (ZWO 12-bit native ÷ 16).
-For ASI585MM Pro at gain 250: G ≈ 0.022 e⁻/ADU
-(= 0.35 native 12-bit value ÷ 16 for FITS 16-bit container).
+<b>X axis</b>: pixel column — proportional to wavelength (uncalibrated).<br>
+<b>Y axis</b>: ADU — fixed 0 to full sensor range (65 535 for 16-bit).<br><br>
+• <b>White line</b> — hot-pixel-filtered peak per column: the 2nd-highest
+  pixel value across all TARGET rows for each column (rejects single
+  hot pixels without clipping real signal).<br>
+• <b>Amber line</b> — sky background level: sigma-clipped mean across
+  the BG ABOVE and BG BELOW regions per column.<br>
+• <b>Dashed red line</b> — linearity limit at 80 % of full ADU range
+  (52 428 ADU for a 16-bit sensor). Pixels above this may show
+  non-linear detector response.<br>
+• <b>Red shading</b> — column runs where the peak pixel exceeds the
+  linearity limit.<br><br>
+<b>Zoom buttons</b> (below the chart): ⊕ Zoom draws a rubber-band box
+to zoom both axes. "Zoom to range" sets the Y scale so the spectrum
+peak sits at 80 % of the visible range. ↺ Reset restores full view.
+Zoom settings persist across file loads until Reset is clicked.
 """,
 
 "advisory": """
@@ -505,8 +556,6 @@ DEFAULTS: dict = {
     "saturation_threshold": 0.70,
     "target_fill":          0.80,
     "stretch_value":        3,
-    "normalize_spectrum":   False,
-    "show_snr":             True,
     "gain_advice_on":       False,
     # NOTE: ZWO FITS header GAIN = slider value (0–570), NOT e-/ADU.
     # conversion_gain = e_per_16bit_ADU for SNR math (ZWO 12-bit native / 16).
@@ -817,6 +866,217 @@ def fit_gaussian_spatial(profile: np.ndarray,
         return None, None, False
 
 
+# ── Wavelength calibration functions ─────────────────────────────────────────
+
+def detect_slant(data: np.ndarray, y_lo: int, y_hi: int) -> float:
+    """Measure spectral trace slant in degrees from a 2D lamp image."""
+    strip = data[y_lo:y_hi, :].astype(np.float64)
+    n_rows, n_cols = strip.shape
+    if n_rows < 3 or n_cols < 50:
+        return 0.0
+    col_sum = strip.mean(axis=0)
+    max_val = col_sum.max()
+    if max_val <= 0:
+        return 0.0
+    peaks, props = find_peaks(col_sum, prominence=0.1 * max_val, distance=50)
+    if len(peaks) < 3:
+        return 0.0
+    prom = props['prominences']
+    order = np.argsort(prom)[::-1]
+    peaks = peaks[order[:8]]
+    y_coords = np.arange(n_rows, dtype=float)
+
+    def _gaussian(y, amp, mu, sigma):
+        return amp * np.exp(-(y - mu) ** 2 / (2 * sigma ** 2))
+
+    centroid_ys, peak_cols = [], []
+    for px_c in peaks:
+        col_data = strip[:, px_c]
+        try:
+            p0 = [col_data.max(), n_rows / 2.0, 3.0]
+            popt, _ = curve_fit(_gaussian, y_coords, col_data, p0=p0, maxfev=500)
+            centroid_ys.append(popt[1])
+            peak_cols.append(float(px_c))
+        except Exception:
+            continue
+    if len(peak_cols) < 2:
+        return 0.0
+    slope, _ = np.polyfit(peak_cols, centroid_ys, 1)
+    return float(np.clip(np.degrees(np.arctan(slope)), -5.0, 5.0))
+
+
+def apply_slant_correction(data: np.ndarray, slant_deg: float) -> np.ndarray:
+    # TODO: expose slant_deg via MainWindow so Spectrum tab can optionally
+    # apply the same correction to science frames.
+    return rotate(data.astype(np.float32), -slant_deg,
+                  reshape=False, order=1, mode='nearest').astype(np.float32)
+
+
+def extract_cal_spectrum(data: np.ndarray, y_lo: int, y_hi: int,
+                         slant_deg: float = 0.0) -> np.ndarray:
+    """Column-sum the calibration image within the target Y-region."""
+    if abs(slant_deg) > 0.05:
+        corrected = apply_slant_correction(data, slant_deg).astype(float)
+    else:
+        corrected = data.astype(float)
+    strip = corrected[y_lo:y_hi + 1, :]
+    return strip.sum(axis=0).astype(float)
+
+
+def detect_emission_peaks(spectrum: np.ndarray) -> np.ndarray:
+    """Find candidate emission-line pixel positions in a lamp spectrum."""
+    from scipy.ndimage import uniform_filter1d
+    sm = uniform_filter1d(spectrum.astype(float), size=3)
+    if sm.max() <= 0:
+        return np.array([], dtype=int)
+    peaks, _ = find_peaks(sm, prominence=0.03 * sm.max(), width=1, distance=8)
+    if len(peaks) < 2:
+        return np.array([], dtype=int)
+    return np.sort(peaks)
+
+
+def _fit_best_order(px_arr: np.ndarray, wav_arr: np.ndarray) -> np.ndarray:
+    """Select optimal polynomial order by BIC and return fitted coefficients."""
+    n = len(px_arr)
+    best_coef, best_bic = None, np.inf
+    for order in [2, 3, 4]:
+        if n < order + 2:
+            continue
+        if order > 2 and int(np.sum(wav_arr < 5500)) < 2:
+            continue
+        c = np.polyfit(px_arr, wav_arr, order)
+        resid = wav_arr - np.polyval(c, px_arr)
+        rss = float(np.sum(resid ** 2))
+        k = order + 1
+        bic = n * np.log(rss / n + 1e-12) + k * np.log(n)
+        if bic < best_bic - 2.0:
+            best_bic = bic
+            best_coef = c
+    if best_coef is None:
+        best_coef = np.polyfit(px_arr, wav_arr, min(2, n - 1))
+    return best_coef
+
+
+def auto_solve_lamp(spectrum: np.ndarray, lamp_key: str):
+    """Fully automatic lamp line matching. Returns result dict or None."""
+    peaks = detect_emission_peaks(spectrum)
+    if len(peaks) < 3:
+        return None
+    n_cols = len(spectrum)
+    known_waves = [w for (_, w) in LAMP_LINES[lamp_key]["lines"]]
+
+    # Grid search for linear seed
+    lambda_starts = np.arange(3300, 4500, 10)
+    dispersions   = np.arange(0.90, 1.81, 0.02)
+    best_score, best_seed = 0, (3600.0, 1.1)
+    tolerance_grid = 15
+    for lam0 in lambda_starts:
+        for d in dispersions:
+            score = sum(
+                1 for w in known_waves
+                if 0 <= (w - lam0) / d <= n_cols
+                and np.any(np.abs(peaks - (w - lam0) / d) <= tolerance_grid)
+            )
+            if score > best_score:
+                best_score = score
+                best_seed = (float(lam0), float(d))
+    if best_score < 3:
+        return None
+
+    def _neg_score(params):
+        lam0, d = params
+        if d <= 0.1:
+            return 0.0
+        return -float(sum(
+            1 for w in known_waves
+            if 0 <= (w - lam0) / d <= n_cols
+            and np.any(np.abs(peaks - (w - lam0) / d) <= 12)
+        ))
+
+    res = minimize(_neg_score, best_seed, method='Nelder-Mead',
+                   options={'xatol': 1.0, 'fatol': 0.5, 'maxiter': 500})
+    lam0, d = res.x
+    if d <= 0.1:
+        lam0, d = best_seed
+
+    # Iterative match + polynomial refinement
+    coef = np.array([d, lam0])
+    matched_pairs = []
+    for tol in [25, 12, 6]:
+        new_pairs = []
+        all_px = np.arange(n_cols)
+        all_w  = np.polyval(coef, all_px)
+        for (ion, wave) in LAMP_LINES[lamp_key]["lines"]:
+            px_pred = float(all_px[np.argmin(np.abs(all_w - wave))])
+            if not (0 <= px_pred <= n_cols - 1):
+                continue
+            near = peaks[np.abs(peaks - px_pred) <= tol]
+            if len(near) == 0:
+                continue
+            best_peak = near[int(np.argmin(np.abs(near - px_pred)))]
+            new_pairs.append((float(best_peak), wave, ion))
+        if len(new_pairs) < 2:
+            break
+        matched_pairs = new_pairs
+        px_arr  = np.array([p[0] for p in matched_pairs])
+        wav_arr = np.array([p[1] for p in matched_pairs])
+        coef = _fit_best_order(px_arr, wav_arr)
+
+    if len(matched_pairs) < 4:
+        return {"n_matched": len(matched_pairs)}
+
+    px_arr  = np.array([p[0] for p in matched_pairs])
+    wav_arr = np.array([p[1] for p in matched_pairs])
+    fitted  = np.polyval(coef, px_arr)
+    resid   = wav_arr - fitted
+    rms_global = float(np.sqrt(np.mean(resid ** 2)))
+    blue_mask  = wav_arr < 5500
+    red_mask   = ~blue_mask
+    rms_blue = float(np.sqrt(np.mean(resid[blue_mask] ** 2))) if blue_mask.any() else float('nan')
+    rms_red  = float(np.sqrt(np.mean(resid[red_mask]  ** 2))) if red_mask.any()  else float('nan')
+    all_w = np.polyval(coef, np.arange(n_cols))
+    frame_min, frame_max = all_w.min(), all_w.max()
+    n_total = sum(1 for (_, w) in LAMP_LINES[lamp_key]["lines"]
+                  if frame_min <= w <= frame_max)
+    return {
+        "coef":          coef,
+        "poly_order":    len(coef) - 1,
+        "rms_global":    rms_global,
+        "rms_blue":      rms_blue,
+        "rms_red":       rms_red,
+        "n_matched":     len(matched_pairs),
+        "n_total":       n_total,
+        "lambda_min":    float(wav_arr.min()),
+        "lambda_max":    float(wav_arr.max()),
+        "matched_pairs": matched_pairs,
+    }
+
+
+def fit_gaussian_absorption(x: np.ndarray, y: np.ndarray):
+    """Find centroid of absorption dip in a sub-range of the 1D spectrum."""
+    if len(x) < 5:
+        return None
+    n10 = max(1, len(x) // 10)
+    x_bl = np.concatenate([x[:n10], x[-n10:]])
+    y_bl = np.concatenate([y[:n10], y[-n10:]])
+    slope_bl, intercept_bl = np.polyfit(x_bl.astype(float), y_bl.astype(float), 1)
+    y_sub = y.astype(float) - (slope_bl * x.astype(float) + intercept_bl)
+    y_inv = -y_sub
+
+    def _gaussian(xv, amp, mu, sigma):
+        return amp * np.exp(-(xv - mu) ** 2 / (2 * sigma ** 2))
+
+    try:
+        p0 = [float(y_inv.max()), float(x[y_inv.argmax()]), (float(x[-1]) - float(x[0])) / 6]
+        bounds = ([0.0, float(x[0]), 1.0],
+                  [np.inf, float(x[-1]), (float(x[-1]) - float(x[0])) / 2 + 1])
+        popt, _ = curve_fit(_gaussian, x.astype(float), y_inv, p0=p0,
+                             bounds=bounds, maxfev=1000)
+        return float(popt[1])
+    except Exception:
+        return float(x[int(y_inv.argmax())])
+
+
 # ── Online statistics (Welford) ───────────────────────────────────────────────
 class WelfordStats:
     """Per-column running mean/variance using Welford's numerically stable algorithm."""
@@ -869,6 +1129,46 @@ class FrameRecord:
     @property
     def peak_fill(self) -> float:
         return self.peak_adu / self.sat_limit if self.sat_limit > 0 else 0.0
+
+
+# ── Wavelength calibration dataclass ──────────────────────────────────────────
+@dataclass
+class WavelengthCalibration:
+    """Polynomial wavelength calibration result.
+
+    coef follows numpy.polyfit convention: highest-degree coefficient first.
+    pixel_to_wave(px) = numpy.polyval(coef, px)
+    """
+    coef:        list
+    poly_order:  int
+    rms_global:  float
+    rms_blue:    float
+    rms_red:     float
+    n_matched:   int
+    n_total:     int
+    lambda_min:  float
+    lambda_max:  float
+    slant_deg:   float
+    lamp_type:   str
+    source_file: str
+    timestamp:   str
+
+    def pixel_to_wave(self, px) -> np.ndarray:
+        return np.polyval(self.coef, np.asarray(px, dtype=float))
+
+    def wave_to_pixel_approx(self, wave: float) -> float:
+        px = np.arange(3840, dtype=float)
+        lam = self.pixel_to_wave(px)
+        idx = int(np.argmin(np.abs(lam - wave)))
+        return float(idx)
+
+    def to_dict(self) -> dict:
+        import dataclasses as _dc
+        return _dc.asdict(self)
+
+    @classmethod
+    def from_dict(cls, d: dict) -> "WavelengthCalibration":
+        return cls(**d)
 
 
 # ── Session data ──────────────────────────────────────────────────────────────
@@ -1070,8 +1370,11 @@ class ImageCanvas(FigureCanvas):
         self._zoom_mode: bool       = False
         self._zoom_start            = None   # (x, y) data coords on press
         self._zoom_patch            = None   # amber Rectangle being drawn
-        self._full_xlim             = None   # saved full view limits
+        self._full_xlim             = None   # full-view limits (updated each refresh)
         self._full_ylim             = None
+        self._zoomed                = False  # True = user has zoomed; persists across file loads
+        self._zoom_xlim             = None   # saved user zoom limits
+        self._zoom_ylim             = None
 
         self.mpl_connect("button_press_event",   self._on_press)
         self.mpl_connect("motion_notify_event",  self._on_motion)
@@ -1096,8 +1399,6 @@ class ImageCanvas(FigureCanvas):
         self.ax.set_ylabel("Y pixel", color=TEXT, fontsize=9)
         self._mpl_lines.clear(); self._mpl_hdls.clear(); self._mpl_lbls.clear()
 
-        # Reset zoom state on image reload
-        was_zoomed = self._full_xlim is not None
         self._full_xlim = None
         self._full_ylim = None
         self._zoom_patch = None
@@ -1107,8 +1408,6 @@ class ImageCanvas(FigureCanvas):
             self.ax.text(0.5, 0.5, "No image loaded", color=TEXT,
                          ha="center", va="center", transform=self.ax.transAxes, fontsize=14)
             self.draw_idle()
-            if was_zoomed:
-                self.zoom_reset_sig.emit()
             return
 
         data = fits_data["data"]; h, w = data.shape
@@ -1143,9 +1442,14 @@ class ImageCanvas(FigureCanvas):
 
         self._draw_lines(w, h)
         self.ax.set_xlim(0, w); self.ax.set_ylim(h, 0)
+        self._full_xlim = self.ax.get_xlim()
+        self._full_ylim = self.ax.get_ylim()
+        if self._zoomed:
+            if self._zoom_xlim is not None:
+                self.ax.set_xlim(self._zoom_xlim)
+            if self._zoom_ylim is not None:
+                self.ax.set_ylim(self._zoom_ylim)
         self.draw_idle()
-        if was_zoomed:
-            self.zoom_reset_sig.emit()
 
     def update_lines_only(self):
         for key, line in self._mpl_lines.items():
@@ -1188,13 +1492,22 @@ class ImageCanvas(FigureCanvas):
         cursor = Qt.CursorShape.CrossCursor if enabled else Qt.CursorShape.ArrowCursor
         self.setCursor(QCursor(cursor))
 
+    def set_xrange(self, x_min: float, x_max: float):
+        """Sync x-axis from spectrum canvas zoom (preserves y-axis zoom)."""
+        self.ax.set_xlim(x_min, x_max)
+        self._zoomed    = True
+        self._zoom_xlim = (x_min, x_max)
+        # _zoom_ylim left unchanged so y-zoom from image drag is preserved
+        self.draw_idle()
+
     def reset_zoom(self):
-        """Restore full image view and notify spectrum canvas."""
+        """Restore full image view and clear persisted zoom state."""
+        self._zoomed    = False
+        self._zoom_xlim = None
+        self._zoom_ylim = None
         if self._full_xlim is not None:
             self.ax.set_xlim(self._full_xlim)
             self.ax.set_ylim(self._full_ylim)
-            self._full_xlim = None
-            self._full_ylim = None
             self.draw_idle()
             self.zoom_reset_sig.emit()
 
@@ -1262,6 +1575,9 @@ class ImageCanvas(FigureCanvas):
                 self.ax.set_xlim(xl[0], xl[1])
                 # Image y-axis is inverted (origin=upper): larger row number = lower
                 self.ax.set_ylim(max(yl), min(yl))
+                self._zoomed   = True
+                self._zoom_xlim = self.ax.get_xlim()
+                self._zoom_ylim = self.ax.get_ylim()
                 self.draw_idle()
                 self.zoom_x_changed.emit(xl[0], xl[1])
             else:
@@ -1276,6 +1592,8 @@ class ImageCanvas(FigureCanvas):
 
 # ── Spectrum canvas ────────────────────────────────────────────────────────────
 class SpectrumCanvas(FigureCanvas):
+    zoom_x_changed = pyqtSignal(float, float)
+
     def __init__(self):
         self.fig = Figure(facecolor=DARK_BG)
         super().__init__(self.fig)
@@ -1284,12 +1602,26 @@ class SpectrumCanvas(FigureCanvas):
         self.ax.set_facecolor(DARK_BG)
         self.fig.subplots_adjust(left=0.09, right=0.86, top=0.97, bottom=0.11)
         self.setSizePolicy(QSizePolicy.Policy.Expanding, QSizePolicy.Policy.Expanding)
-        self._full_xlim = None
+        self._full_xlim  = None
+        self._full_ylim  = None
+        self._zoom_mode  = False
+        self._zoom_start = None   # (x, y) data coords on press
+        self._zoom_patch = None   # Rectangle being drawn
+        self._zoomed     = False  # True = user zoom active; persists across file loads
+        self._zoom_xlim  = None
+        self._zoom_ylim  = None
+        self._peak_col_max: float | None = None
 
-    def refresh(self, fits_data, cfg, show_snr, normalize):
+        self.mpl_connect("button_press_event",   self._on_press)
+        self.mpl_connect("motion_notify_event",  self._on_motion)
+        self.mpl_connect("button_release_event", self._on_release)
+
+    def refresh(self, fits_data, cfg):
         self.fig.set_facecolor(DARK_BG)
         self.ax.cla(); self.ax_snr.cla()
-        self._full_xlim = None
+        self._full_xlim  = None
+        self._full_ylim  = None
+        self._peak_col_max = None
         for ax in (self.ax, self.ax_snr):
             ax.set_facecolor(DARK_BG)
             ax.tick_params(colors=TEXT, labelsize=8)
@@ -1300,7 +1632,8 @@ class SpectrumCanvas(FigureCanvas):
 
         data       = fits_data["data"]
         full_range = fits_data["full_range"]
-        sat_limit  = cfg["saturation_threshold"] * full_range
+        LINEARITY_FRAC  = 0.80
+        linearity_limit = LINEARITY_FRAC * full_range   # e.g. 52428 for 16-bit
 
         x, spec, bg, tsum, n = extract_spectrum(
             data,
@@ -1309,22 +1642,28 @@ class SpectrumCanvas(FigureCanvas):
             (cfg["bg_below_y_start"], cfg["bg_below_y_end"]),
         )
 
-        sat_line = sat_limit * n
-        sp_plot  = spec.copy()
-        raw_plot = tsum.copy()
-        if normalize:
-            pk = float(np.max(np.abs(sp_plot))) or 1.0
-            sp_plot /= pk; raw_plot /= pk; sat_line /= pk
+        def _col_max_hp(region: np.ndarray) -> np.ndarray:
+            """2nd-highest pixel per column (hot-pixel filtered); falls back to max if 1 row."""
+            if region.shape[0] >= 2:
+                return np.partition(region, -2, axis=0)[-2, :].astype(float)
+            return region.max(axis=0).astype(float)
 
-        self.ax.plot(x, raw_plot,  color=RAW_C,  lw=0.5, label="Raw sum",         zorder=2)
-        self.ax.plot(x, sp_plot,   color=SPEC_C, lw=1.1, label="Extracted bg-sub", zorder=3)
-        self.ax.axhline(sat_line,  color=SAT_C,  lw=1.0, ls="--", alpha=0.85,
-                        label=f"Sat. limit ({int(cfg['saturation_threshold']*100)}%)", zorder=4)
+        # Target: hot-pixel-filtered max per column
+        h = data.shape[0]
+        _y0 = min(int(cfg["target_y_start"]), int(cfg["target_y_end"]))
+        _y1 = max(int(cfg["target_y_start"]), int(cfg["target_y_end"])) + 1
+        col_max = _col_max_hp(data[max(0, _y0):min(h, _y1), :])
+        self._peak_col_max = float(col_max.max()) if len(col_max) else None
 
-        # Saturation column shading — compare raw column sum to sat_line so shading
-        # is consistent with the drawn sat_line (not individual-pixel threshold).
-        raw_for_shade = raw_plot if normalize else tsum
-        shade_mask = raw_for_shade > sat_line
+        lin_line = linearity_limit
+
+        self.ax.plot(x, col_max, color="white", lw=0.7, label="Max ADU (hot-px filtered)", zorder=2)
+        self.ax.plot(x, bg,      color=BG_C,    lw=0.7, label="Sky background (bg/px)",    zorder=2)
+        self.ax.axhline(lin_line,   color=SAT_C,   lw=1.2, ls=":",  alpha=0.85,
+                        label="Linearity limit (80%)", zorder=4)
+
+        # Saturation column shading
+        shade_mask = col_max > lin_line
         in_run = False
         for i, s in enumerate(shade_mask):
             if s and not in_run:  start = i; in_run = True
@@ -1335,60 +1674,125 @@ class SpectrumCanvas(FigureCanvas):
             self.ax.axvspan(start - 0.5, len(shade_mask) - 0.5,
                             facecolor=SAT_C, alpha=0.18, zorder=3)
 
-        # Y axis: full ADU range when not normalized, autoscale when normalized
-        if normalize:
-            smin = float(np.min(sp_plot)); smax = float(np.max(sp_plot))
-            pad  = max((smax - smin) * 0.06, 1.0)
-            ytop = max(smax + pad, sat_line if sat_line < smax * 3 else smax + pad)
-            self.ax.set_ylim(smin - pad, ytop + pad)
-        else:
-            full_scale = full_range * n          # max possible column sum
-            sp_floor   = min(float(np.min(sp_plot)), 0.0)
-            self.ax.set_ylim(sp_floor, full_scale * 1.02)
-            self.ax.axhline(full_scale, color=TEXT_DIM, lw=0.7, ls="--",
-                            alpha=0.5, label=f"Linear ADU ×{n} rows", zorder=2)
-
-        ylabel = "Intensity (norm.)" if normalize else "Intensity (ADU · rows)"
+        # Y axis: fixed 0–full_range
+        self.ax.set_ylim(0, full_range * 1.02)
         self.ax.set_xlabel("X pixel  (∝ wavelength)", color=TEXT, fontsize=9)
-        self.ax.set_ylabel(ylabel, color=TEXT, fontsize=9)
+        self.ax.set_ylabel("ADU (max per column)", color=TEXT, fontsize=9)
+        self.ax.yaxis.set_major_formatter(FuncFormatter(_fmt_spec_y))
 
-        # k/M formatter for y-axis (not when normalized — values are 0–1)
-        if not normalize:
-            self.ax.yaxis.set_major_formatter(FuncFormatter(_fmt_spec_y))
-
-        if show_snr:
-            snr = compute_snr(spec, bg, n, cfg["conversion_gain"], cfg["read_noise"])
-            self.ax_snr.plot(x, snr, color=SNR_C, lw=0.9, ls=":",
-                             alpha=0.9, label="SNR  (right axis)", zorder=2)
-            self.ax_snr.set_ylabel("SNR", color=TEXT, fontsize=9)
-            self.ax_snr.yaxis.set_label_position("right")
-            self.ax_snr.yaxis.label.set_color(TEXT)
-            self.ax_snr.tick_params(axis="y", colors=TEXT, labelsize=8)
-            self.ax_snr.spines["right"].set_edgecolor(DARK_BORDER)
-        else:
-            self.ax_snr.set_yticks([])
-            self.ax_snr.spines["right"].set_edgecolor(DARK_BORDER)
+        # Hide unused right axis
+        self.ax_snr.set_yticks([])
+        self.ax_snr.spines["right"].set_visible(False)
 
         h1, l1 = self.ax.get_legend_handles_labels()
-        h2, l2 = self.ax_snr.get_legend_handles_labels()
-        self.ax.legend(h1 + h2, l1 + l2, loc="upper right", fontsize=8,
+        self.ax.legend(h1, l1, loc="upper right", fontsize=8,
                        facecolor=DARK_PANEL, edgecolor=DARK_BORDER, labelcolor=TEXT)
 
-        # Save full xlim for reset_xrange()
+        # Save full limits, then re-apply persisted zoom if active
         self._full_xlim = self.ax.get_xlim()
+        self._full_ylim = self.ax.get_ylim()
+        if self._zoomed:
+            if self._zoom_xlim is not None:
+                self.ax.set_xlim(self._zoom_xlim)
+            if self._zoom_ylim is not None:
+                self.ax.set_ylim(self._zoom_ylim)
         self.draw_idle()
         return x, spec, bg, n
 
     def set_xrange(self, x_min: float, x_max: float, spec_data=None):
-        """Synchronise x-axis with image canvas zoom."""
+        """Synchronise x-axis from an external zoom (image or session canvas)."""
         self.ax.set_xlim(x_min, x_max)
+        self._zoomed    = True
+        self._zoom_xlim = (x_min, x_max)
         self.draw_idle()
 
     def reset_xrange(self):
-        """Restore full x-axis view saved during last refresh()."""
+        """Restore full view and clear persisted zoom state."""
+        self._zoomed    = False
+        self._zoom_xlim = None
+        self._zoom_ylim = None
         if self._full_xlim is not None:
             self.ax.set_xlim(self._full_xlim)
-            self._full_xlim = None
+        if self._full_ylim is not None:
+            self.ax.set_ylim(self._full_ylim)
+        self.draw_idle()
+
+    def reset_zoom(self):
+        self.reset_xrange()
+
+    def zoom_to_data_range(self):
+        """Zoom Y so the target peak sits at 80% of the visible scale."""
+        if self._peak_col_max is None or self._peak_col_max <= 0:
+            return
+        y_top = self._peak_col_max / 0.80
+        self.ax.set_ylim(0, y_top)
+        self._zoomed    = True
+        self._zoom_ylim = (0, y_top)
+        self.draw_idle()
+
+    def set_zoom_mode(self, enabled: bool):
+        self._zoom_mode = enabled
+        cursor = Qt.CursorShape.CrossCursor if enabled else Qt.CursorShape.ArrowCursor
+        self.setCursor(QCursor(cursor))
+
+    def _to_ax_coords(self, event):
+        """Convert event screen position to self.ax data coordinates.
+        Needed because ax_snr (twinx) captures events and reports ydata
+        in its own coordinate space, not ax's."""
+        try:
+            x, y = self.ax.transData.inverted().transform((event.x, event.y))
+            return float(x), float(y)
+        except Exception:
+            return None, None
+
+    def _on_press(self, event):
+        if not self._zoom_mode or event.inaxes not in (self.ax, self.ax_snr) or event.button != 1:
+            return
+        x, y = self._to_ax_coords(event)
+        if x is not None:
+            self._zoom_start = (x, y)
+            self._zoom_patch = Rectangle(
+                (x, y), 0, 0,
+                linewidth=1.5, edgecolor=ACCENT, facecolor=ACCENT,
+                alpha=0.12, zorder=10, linestyle="--"
+            )
+            self.ax.add_patch(self._zoom_patch)
+            self.draw_idle()
+
+    def _on_motion(self, event):
+        if not self._zoom_mode or self._zoom_start is None or self._zoom_patch is None:
+            return
+        if event.inaxes not in (self.ax, self.ax_snr):
+            return
+        x, y = self._to_ax_coords(event)
+        if x is not None:
+            x0, y0 = self._zoom_start
+            self._zoom_patch.set_bounds(
+                min(x0, x), min(y0, y),
+                abs(x - x0), abs(y - y0)
+            )
+            self.draw_idle()
+
+    def _on_release(self, event):
+        if not self._zoom_mode or self._zoom_start is None:
+            return
+        x0, y0 = self._zoom_start
+        self._zoom_start = None
+        if self._zoom_patch is not None:
+            self._zoom_patch.remove()
+            self._zoom_patch = None
+        x, y = self._to_ax_coords(event)
+        if x is not None and abs(x - x0) > 5 and abs(y - y0) > 5:
+            xl = sorted([x0, x])
+            yl = sorted([y0, y])
+            self.ax.set_xlim(xl[0], xl[1])
+            self.ax.set_ylim(yl[0], yl[1])
+            self._zoomed    = True
+            self._zoom_xlim = tuple(self.ax.get_xlim())
+            self._zoom_ylim = tuple(self.ax.get_ylim())
+            self.draw_idle()
+            self.zoom_x_changed.emit(xl[0], xl[1])
+        else:
             self.draw_idle()
 
 
@@ -1497,7 +1901,7 @@ class AdvisoryPanel(QWidget):
 
         data       = fits_data["data"]
         full_range = fits_data["full_range"]
-        sat_limit  = cfg["saturation_threshold"] * full_range
+        sat_limit  = 0.80 * full_range   # linearity limit: 80% of full ADU range
 
         # ── Exposure + Gain slider ──
         et = fits_data.get("exptime")
@@ -2810,6 +3214,788 @@ class SessionMonitorWidget(QWidget):
         return self.fwhm_panel.spin_flat.value()
 
 
+# ── Calibration canvases ──────────────────────────────────────────────────────
+
+class CalibrationImageCanvas(FigureCanvas):
+    region_changed = pyqtSignal(int, int)
+
+    def __init__(self, parent=None):
+        self._fig = Figure(figsize=(5, 2.2), facecolor=DARK_BG)
+        super().__init__(self._fig)
+        self._ax = self._fig.add_axes([0, 0, 1, 1])
+        self._data = None
+        self._y_lo = 80
+        self._y_hi = 160
+        self._slant_deg = 0.0
+        self._drag_line = None
+        self._line_lo = None
+        self._line_hi = None
+        self.mpl_connect('button_press_event',   self._on_press)
+        self.mpl_connect('motion_notify_event',  self._on_motion)
+        self.mpl_connect('button_release_event', self._on_release)
+
+    def load(self, data: np.ndarray):
+        self._data = data.astype(np.float32)
+        self.refresh()
+
+    def set_region(self, y_lo: int, y_hi: int):
+        self._y_lo = y_lo
+        self._y_hi = y_hi
+        if self._line_lo is not None:
+            self._line_lo.set_ydata([y_lo, y_lo])
+        if self._line_hi is not None:
+            self._line_hi.set_ydata([y_hi, y_hi])
+        self.draw_idle()
+
+    def refresh(self):
+        ax = self._ax
+        ax.clear()
+        ax.set_facecolor(DARK_BG)
+        if self._data is None:
+            self._fig.set_facecolor(DARK_BG)
+            self.draw_idle()
+            return
+        flat = self._data.ravel()
+        vlo = float(np.percentile(flat, 1))
+        vhi = float(np.percentile(flat, 99))
+        n_rows, n_cols = self._data.shape
+        ax.imshow(self._data, aspect='auto', origin='upper',
+                  vmin=vlo, vmax=vhi, cmap='gray', interpolation='nearest')
+        self._line_lo, = ax.plot([0, n_cols - 1], [self._y_lo, self._y_lo],
+                                  '--', color=TARGET_C, linewidth=1.2)
+        self._line_hi, = ax.plot([0, n_cols - 1], [self._y_hi, self._y_hi],
+                                  '--', color=TARGET_C, linewidth=1.2)
+        if abs(self._slant_deg) > 0.05:
+            slope = np.tan(np.radians(self._slant_deg))
+            y_mid = (self._y_lo + self._y_hi) / 2.0
+            y0 = y_mid - slope * n_cols / 2.0
+            y1 = y_mid + slope * n_cols / 2.0
+            ax.plot([0, n_cols - 1], [y0, y1], color=WARN, alpha=0.4, linewidth=1)
+            ax.text(0.98, 0.05, f"slant {self._slant_deg:+.2f}°",
+                    transform=ax.transAxes, ha='right', va='bottom',
+                    fontsize=8, color=ACCENT)
+        ax.set_xlim(0, n_cols - 1)
+        ax.set_ylim(n_rows - 1, 0)
+        ax.axis('off')
+        self._fig.set_facecolor(DARK_BG)
+        self.draw_idle()
+
+    def _on_press(self, event):
+        if event.inaxes != self._ax or event.ydata is None:
+            return
+        y = event.ydata
+        if abs(y - self._y_lo) <= 5:
+            self._drag_line = 'lo'
+            self.setCursor(QCursor(Qt.CursorShape.SizeVerCursor))
+        elif abs(y - self._y_hi) <= 5:
+            self._drag_line = 'hi'
+            self.setCursor(QCursor(Qt.CursorShape.SizeVerCursor))
+
+    def _on_motion(self, event):
+        if self._drag_line is None:
+            if event.inaxes == self._ax and event.ydata is not None:
+                y = event.ydata
+                if abs(y - self._y_lo) <= 5 or abs(y - self._y_hi) <= 5:
+                    self.setCursor(QCursor(Qt.CursorShape.SizeVerCursor))
+                else:
+                    self.unsetCursor()
+            return
+        if event.ydata is None:
+            return
+        yi = int(round(event.ydata))
+        if self._drag_line == 'lo':
+            self._y_lo = yi
+            if self._line_lo is not None:
+                self._line_lo.set_ydata([yi, yi])
+        else:
+            self._y_hi = yi
+            if self._line_hi is not None:
+                self._line_hi.set_ydata([yi, yi])
+        self.draw_idle()
+
+    def _on_release(self, event):
+        if self._drag_line is not None:
+            self._drag_line = None
+            self.unsetCursor()
+            self.region_changed.emit(self._y_lo, self._y_hi)
+
+
+class CalibrationSpectrumCanvas(FigureCanvas):
+    span_selected = pyqtSignal(float, float)
+
+    def __init__(self, parent=None):
+        fig = Figure(figsize=(5, 1.4), facecolor=DARK_BG)
+        super().__init__(fig)
+        self._fig = fig
+        self._ax = fig.add_subplot(111)
+        self._ax.set_facecolor(DARK_BG)
+        fig.subplots_adjust(left=0.06, right=0.97, top=0.88, bottom=0.25)
+        self._spectrum = None
+        self._matched_pairs = []
+        self._range_selector = None
+
+    def refresh(self, spectrum: np.ndarray, matched_pairs=None):
+        self._spectrum = spectrum
+        self._matched_pairs = matched_pairs or []
+        ax = self._ax
+        ax.clear()
+        ax.set_facecolor(DARK_BG)
+        if spectrum is not None and len(spectrum) > 0:
+            x = np.arange(len(spectrum))
+            ax.plot(x, spectrum, color=SPEC_C, linewidth=0.8)
+            smax = float(spectrum.max()) if spectrum.max() > 0 else 1.0
+            for (px, wave, ion) in self._matched_pairs:
+                ax.axvline(px, color=ACCENT, alpha=0.6, linewidth=0.8, linestyle='--')
+                ax.text(px, -0.12 * smax, f"{ion}\n{wave:.0f}",
+                        ha='center', va='top', fontsize=6, color=ACCENT,
+                        clip_on=True)
+        ax.set_xlabel("pixel", fontsize=7, color=TEXT)
+        ax.tick_params(colors=TEXT_DIM, labelsize=6)
+        for sp in ax.spines.values():
+            sp.set_edgecolor(DARK_BORDER)
+        self._fig.set_facecolor(DARK_BG)
+        self.draw_idle()
+        # Recreate span selector if it was active
+        if self._range_selector is not None:
+            self.enable_span_selector(True)
+
+    def enable_span_selector(self, enabled: bool):
+        if self._range_selector is not None:
+            self._range_selector.set_visible(False)
+            self._range_selector = None
+        if enabled:
+            self._range_selector = SpanSelector(
+                self._ax, self._on_span, 'horizontal',
+                props=dict(facecolor=ACCENT, alpha=0.2),
+                useblit=False,
+            )
+        self.draw_idle()
+
+    def _on_span(self, xmin: float, xmax: float):
+        if xmax > xmin:
+            self.span_selected.emit(float(xmin), float(xmax))
+
+
+class CalibrationResidualsCanvas(FigureCanvas):
+    def __init__(self, parent=None):
+        fig = Figure(figsize=(5, 1.1), facecolor=DARK_BG)
+        super().__init__(fig)
+        self._fig = fig
+        self._ax = fig.add_subplot(111)
+        self._ax.set_facecolor(DARK_BG)
+        fig.subplots_adjust(left=0.10, right=0.97, top=0.88, bottom=0.32)
+        self._clear_axes()
+        self.draw_idle()
+
+    def _clear_axes(self):
+        ax = self._ax
+        ax.clear()
+        ax.set_facecolor(DARK_BG)
+        ax.axhline(0, color=TEXT_DIM, linewidth=0.5)
+        ax.set_ylabel("Δ Å", fontsize=7, color=TEXT)
+        ax.set_xlabel("wavelength (Å)", fontsize=7, color=TEXT)
+        ax.tick_params(colors=TEXT_DIM, labelsize=6)
+        for sp in ax.spines.values():
+            sp.set_edgecolor(DARK_BORDER)
+        self._fig.set_facecolor(DARK_BG)
+
+    def refresh(self, matched_pairs: list, coef: np.ndarray):
+        self._clear_axes()
+        ax = self._ax
+        if not matched_pairs:
+            self.draw_idle()
+            return
+        residuals = [(float(np.polyval(coef, px)), wave - float(np.polyval(coef, px)), ion, wave)
+                     for (px, wave, ion) in matched_pairs]
+        max_resid = max(abs(r[1]) for r in residuals) if residuals else 0
+        ylim = max(max_resid * 1.4, 1.0)
+        for (fw, resid, ion, wave) in residuals:
+            col = '#4466ff' if wave < 5500 else WARN
+            ax.scatter([fw], [resid], s=30, color=col, zorder=3)
+            ax.vlines(fw, 0, resid, colors=col, alpha=0.4, linewidth=1)
+            va = 'bottom' if resid >= 0 else 'top'
+            ax.text(fw, resid, f"{resid:+.2f}", fontsize=7, color=col,
+                    ha='center', va=va)
+        ax.set_ylim(-ylim, ylim)
+        self.draw_idle()
+
+    def clear(self):
+        self._clear_axes()
+        self.draw_idle()
+
+
+class CoverageBar(QWidget):
+    def __init__(self, parent=None):
+        super().__init__(parent)
+        self._lambda_min = WAVE_MIN_DEFAULT
+        self._lambda_max = WAVE_MAX_DEFAULT
+        self.setFixedHeight(24)
+        self.setMinimumWidth(180)
+
+    def set_range(self, lmin: float, lmax: float):
+        self._lambda_min = lmin
+        self._lambda_max = lmax
+        self.update()
+
+    def paintEvent(self, event):
+        from PyQt6.QtGui import QPainter, QColor, QPen
+        p = QPainter(self)
+        p.setRenderHint(QPainter.RenderHint.Antialiasing, False)
+        w, h = self.width(), self.height()
+        wave_range = WAVE_MAX_DEFAULT - WAVE_MIN_DEFAULT
+        # Background track
+        p.fillRect(0, 4, w, h - 8, QColor(DARK_PANEL))
+        p.setPen(QPen(QColor(DARK_BORDER), 1))
+        p.drawRect(0, 4, w - 1, h - 9)
+        # Calibrated region
+        x0 = int((self._lambda_min - WAVE_MIN_DEFAULT) / wave_range * w)
+        x1 = int((self._lambda_max - WAVE_MIN_DEFAULT) / wave_range * w)
+        x0 = max(0, min(x0, w))
+        x1 = max(0, min(x1, w))
+        if x1 > x0:
+            p.fillRect(x0, 4, x1 - x0, h - 8, QColor(OK_COL))
+        # Labels
+        font = p.font()
+        font.setPointSize(7)
+        p.setFont(font)
+        p.setPen(QColor(TEXT_DIM))
+        p.drawText(2, h - 2, "3500")
+        p.drawText(w - 28, h - 2, "8000")
+        mid_x = (x0 + x1) // 2
+        label = f"{self._lambda_min:.0f}–{self._lambda_max:.0f} Å"
+        fm = p.fontMetrics()
+        lw = fm.horizontalAdvance(label)
+        p.setPen(QColor(DARK_BG))
+        p.drawText(max(x0, mid_x - lw // 2), h - 4, label)
+        p.end()
+
+
+class CalibrationTab(QWidget):
+    def __init__(self, parent=None):
+        super().__init__(parent)
+        self._data      = None
+        self._cal_path  = None
+        self._spectrum  = None
+        self._cal: WavelengthCalibration | None = None
+        self._matched_pairs: list = []
+        self._balmer_pairs:  list = []
+        self._pending_px     = None
+        self._last_slant     = 0.0
+        self._build_ui()
+
+    def _build_ui(self):
+        root = QHBoxLayout(self)
+        root.setContentsMargins(6, 6, 6, 6)
+        root.setSpacing(8)
+
+        # ── LEFT COLUMN ──────────────────────────────────────────────────────
+        left_widget = QWidget()
+        left_widget.setFixedWidth(420)
+        left_col = QVBoxLayout(left_widget)
+        left_col.setContentsMargins(0, 0, 0, 0)
+        left_col.setSpacing(4)
+
+        # File header
+        file_bar = QWidget()
+        file_lay = QHBoxLayout(file_bar)
+        file_lay.setContentsMargins(0, 0, 0, 0)
+        self._load_btn = QPushButton("Load Cal Image")
+        self._load_btn.clicked.connect(self._on_load_file)
+        self._file_lbl = QLabel("No file loaded")
+        self._file_lbl.setStyleSheet(f"color:{TEXT_DIM}; font-size:{F_SM};")
+        self._file_lbl.setSizePolicy(QSizePolicy.Policy.Expanding,
+                                     QSizePolicy.Policy.Preferred)
+        file_lay.addWidget(self._load_btn)
+        file_lay.addWidget(self._file_lbl)
+        left_col.addWidget(file_bar)
+
+        # Calibration image canvas
+        self._image_canvas = CalibrationImageCanvas()
+        self._image_canvas.setFixedHeight(180)
+        self._image_canvas.region_changed.connect(self._on_canvas_region_changed)
+        left_col.addWidget(self._image_canvas)
+
+        # Region bar
+        region_bar = QWidget()
+        rb_lay = QHBoxLayout(region_bar)
+        rb_lay.setContentsMargins(0, 0, 0, 0)
+        rb_lay.setSpacing(6)
+        y_lbl = QLabel("Y:")
+        y_lbl.setStyleSheet(f"color:{TEXT}; font-size:{F_SM}; border:none;")
+        self._ylo_spin = QSpinBox()
+        self._ylo_spin.setRange(0, 9999)
+        self._ylo_spin.setFixedWidth(65)
+        self._ylo_spin.valueChanged.connect(self._on_region_spin_changed)
+        arr_lbl = QLabel("→")
+        arr_lbl.setStyleSheet(f"color:{TEXT_DIM}; font-size:{F_SM}; border:none;")
+        self._yhi_spin = QSpinBox()
+        self._yhi_spin.setRange(0, 9999)
+        self._yhi_spin.setFixedWidth(65)
+        self._yhi_spin.valueChanged.connect(self._on_region_spin_changed)
+        inh_lbl = QLabel("inherited from TARGET")
+        inh_lbl.setStyleSheet(f"color:{TEXT_DIM}; font-size:{F_SM}; border:none;")
+        no_bg_lbl = QLabel("(no BG subtraction)")
+        no_bg_lbl.setStyleSheet(f"color:{TEXT_DIM}; font-size:9pt; border:none;")
+        for w in (y_lbl, self._ylo_spin, arr_lbl, self._yhi_spin, inh_lbl):
+            rb_lay.addWidget(w)
+        rb_lay.addStretch()
+        rb_lay.addWidget(no_bg_lbl)
+        left_col.addWidget(region_bar)
+
+        # Spectrum canvas
+        self._spec_canvas = CalibrationSpectrumCanvas()
+        self._spec_canvas.setFixedHeight(120)
+        self._spec_canvas.span_selected.connect(self._on_span_selected)
+        left_col.addWidget(self._spec_canvas)
+
+        # Residuals canvas
+        self._res_canvas = CalibrationResidualsCanvas()
+        self._res_canvas.setFixedHeight(95)
+        left_col.addWidget(self._res_canvas)
+
+        left_col.addStretch()
+        root.addWidget(left_widget)
+
+        # ── RIGHT COLUMN ─────────────────────────────────────────────────────
+        right_widget = QWidget()
+        right_col = QVBoxLayout(right_widget)
+        right_col.setContentsMargins(0, 0, 0, 0)
+        right_col.setSpacing(6)
+
+        # Mode selector
+        mode_bar = QWidget()
+        mode_lay = QHBoxLayout(mode_bar)
+        mode_lay.setContentsMargins(0, 0, 0, 0)
+        mode_lbl = QLabel("Mode:")
+        mode_lbl.setStyleSheet(f"color:{TEXT_DIM}; font-size:10pt; border:none;")
+        self._mode_lamp_btn   = QPushButton("Lamp")
+        self._mode_lamp_btn.setCheckable(True)
+        self._mode_lamp_btn.setChecked(True)
+        self._mode_balmer_btn = QPushButton("Balmer / stellar")
+        self._mode_balmer_btn.setCheckable(True)
+        self._mode_group = QButtonGroup()
+        self._mode_group.addButton(self._mode_lamp_btn,   0)
+        self._mode_group.addButton(self._mode_balmer_btn, 1)
+        self._mode_group.idClicked.connect(self._on_mode_changed)
+        for w in (mode_lbl, self._mode_lamp_btn, self._mode_balmer_btn):
+            mode_lay.addWidget(w)
+        mode_lay.addStretch()
+        right_col.addWidget(mode_bar)
+
+        # Lamp panel
+        self._lamp_panel = QWidget()
+        lp_lay = QVBoxLayout(self._lamp_panel)
+        lp_lay.setContentsMargins(0, 0, 0, 0)
+        lp_lay.setSpacing(4)
+        lamp_row = QWidget()
+        lr_lay = QHBoxLayout(lamp_row)
+        lr_lay.setContentsMargins(0, 0, 0, 0)
+        lamp_lbl = QLabel("Lamp:")
+        lamp_lbl.setStyleSheet(f"color:{TEXT}; border:none;")
+        self._lamp_combo = QComboBox()
+        for key in LAMP_LINES:
+            self._lamp_combo.addItem(LAMP_LINES[key]["label"], userData=key)
+        for i in range(self._lamp_combo.count()):
+            if self._lamp_combo.itemData(i) == "ArH":
+                self._lamp_combo.setCurrentIndex(i)
+                break
+        self._lamp_combo.currentIndexChanged.connect(lambda _: self._on_lamp_changed())
+        self._solve_btn = QPushButton("Solve")
+        self._solve_btn.clicked.connect(self._on_solve)
+        self._solve_btn.setEnabled(False)
+        for w in (lamp_lbl, self._lamp_combo, self._solve_btn):
+            lr_lay.addWidget(w)
+        self._lamp_combo.setSizePolicy(QSizePolicy.Policy.Expanding,
+                                       QSizePolicy.Policy.Preferred)
+        lp_lay.addWidget(lamp_row)
+        self._warn_label = QLabel("")
+        self._warn_label.setStyleSheet(f"color:{WARN}; font-size:{F_SM}; border:none;")
+        self._warn_label.setWordWrap(True)
+        lp_lay.addWidget(self._warn_label)
+        right_col.addWidget(self._lamp_panel)
+
+        # Balmer panel
+        self._balmer_panel = QWidget()
+        bp_lay = QVBoxLayout(self._balmer_panel)
+        bp_lay.setContentsMargins(0, 0, 0, 0)
+        bp_lay.setSpacing(4)
+        instr_lbl = QLabel("Drag a range over each absorption dip, then assign it.")
+        instr_lbl.setStyleSheet(f"color:{TEXT_DIM}; font-size:{F_SM}; border:none;")
+        instr_lbl.setWordWrap(True)
+        bp_lay.addWidget(instr_lbl)
+        self._balmer_list = QListWidget()
+        self._balmer_list.setMaximumHeight(90)
+        self._balmer_list.setStyleSheet(
+            f"QListWidget {{ background:{DARK_PANEL}; color:{TEXT}; "
+            f"border:1px solid {DARK_BORDER}; font-size:{F_SM}; }}")
+        bp_lay.addWidget(self._balmer_list)
+        assign_row = QWidget()
+        ar_lay = QHBoxLayout(assign_row)
+        ar_lay.setContentsMargins(0, 0, 0, 0)
+        self._line_combo = QComboBox()
+        for (name, wave) in STELLAR_LINES:
+            self._line_combo.addItem(f"{name}  {wave:.2f} Å")
+        self._assign_btn = QPushButton("Assign")
+        self._assign_btn.clicked.connect(self._on_assign_balmer)
+        self._clear_balmer_btn = QPushButton("Clear")
+        self._clear_balmer_btn.clicked.connect(self._on_clear_balmer)
+        for w in (self._line_combo, self._assign_btn, self._clear_balmer_btn):
+            ar_lay.addWidget(w)
+        self._line_combo.setSizePolicy(QSizePolicy.Policy.Expanding,
+                                       QSizePolicy.Policy.Preferred)
+        bp_lay.addWidget(assign_row)
+        right_col.addWidget(self._balmer_panel)
+        self._balmer_panel.setVisible(False)
+
+        # Slant section
+        slant_frame = QFrame()
+        slant_lay = QHBoxLayout(slant_frame)
+        slant_lay.setContentsMargins(4, 2, 4, 2)
+        slant_lbl = QLabel("Slant:")
+        slant_lbl.setStyleSheet(f"color:{TEXT_DIM}; font-size:10pt; border:none;")
+        self._slant_val_label = QLabel("—")
+        self._slant_val_label.setStyleSheet(f"color:{ACCENT}; border:none;")
+        self._slant_apply_chk = QCheckBox("Apply correction")
+        for w in (slant_lbl, self._slant_val_label):
+            slant_lay.addWidget(w)
+        slant_lay.addStretch()
+        slant_lay.addWidget(self._slant_apply_chk)
+        right_col.addWidget(slant_frame)
+
+        # Result section
+        self._result_section = QWidget()
+        rs_lay = QVBoxLayout(self._result_section)
+        rs_lay.setContentsMargins(0, 0, 0, 0)
+        rs_lay.setSpacing(4)
+        cards_widget = QWidget()
+        cards_grid = QGridLayout(cards_widget)
+        cards_grid.setContentsMargins(0, 0, 0, 0)
+        cards_grid.setSpacing(4)
+        self._card_rms_global = self._make_metric_card("RMS global",       "—")
+        self._card_matched    = self._make_metric_card("Lines matched",     "—")
+        self._card_rms_blue   = self._make_metric_card("RMS blue (<5500)", "—")
+        self._card_rms_red    = self._make_metric_card("RMS red (≥5500)",  "—")
+        cards_grid.addWidget(self._card_rms_global[0], 0, 0)
+        cards_grid.addWidget(self._card_matched[0],    0, 1)
+        cards_grid.addWidget(self._card_rms_blue[0],   1, 0)
+        cards_grid.addWidget(self._card_rms_red[0],    1, 1)
+        rs_lay.addWidget(cards_widget)
+        cov_row = QWidget()
+        cov_lay = QHBoxLayout(cov_row)
+        cov_lay.setContentsMargins(0, 0, 0, 0)
+        cov_lbl = QLabel("Coverage:")
+        cov_lbl.setStyleSheet(f"color:{TEXT_DIM}; font-size:{F_SM}; border:none;")
+        self._coverage_bar = CoverageBar()
+        cov_lay.addWidget(cov_lbl)
+        cov_lay.addWidget(self._coverage_bar, stretch=1)
+        rs_lay.addWidget(cov_row)
+        self._poly_order_label = QLabel("Polynomial order: —")
+        self._poly_order_label.setStyleSheet(
+            f"color:{TEXT_DIM}; font-size:{F_SM}; border:none;")
+        rs_lay.addWidget(self._poly_order_label)
+        self._rms_caveat_label = QLabel("RMS reflects centroiding accuracy")
+        self._rms_caveat_label.setStyleSheet(
+            f"color:{TEXT_DIM}; font-size:9pt; border:none;")
+        rs_lay.addWidget(self._rms_caveat_label)
+        right_col.addWidget(self._result_section)
+        self._result_section.setVisible(False)
+
+        # Error panel
+        self._error_panel = QFrame()
+        ep_lay = QVBoxLayout(self._error_panel)
+        ep_lay.setContentsMargins(4, 4, 4, 4)
+        self._error_label = QLabel("")
+        self._error_label.setStyleSheet(f"color:{WARN}; border:none;")
+        self._error_label.setWordWrap(True)
+        ep_lay.addWidget(self._error_label)
+        right_col.addWidget(self._error_panel)
+        self._error_panel.setVisible(False)
+
+        # Save button
+        self._save_btn = QPushButton("Save → wavelength_cal.json")
+        self._save_btn.clicked.connect(self._on_save)
+        self._save_btn.setEnabled(False)
+        right_col.addWidget(self._save_btn)
+        right_col.addStretch()
+        root.addWidget(right_widget, stretch=1)
+
+    def _make_metric_card(self, label_text: str, value_text: str):
+        frame = QFrame()
+        frame.setStyleSheet(
+            f"QFrame {{ background:{DARK_PANEL}; border:1px solid {DARK_BORDER}; "
+            f"border-radius:3px; }}")
+        lay = QVBoxLayout(frame)
+        lay.setContentsMargins(6, 4, 6, 4)
+        lay.setSpacing(1)
+        lbl = QLabel(label_text)
+        lbl.setStyleSheet(f"color:{TEXT_DIM}; font-size:9pt; border:none;")
+        val = QLabel(value_text)
+        val.setStyleSheet(
+            f"color:{OK_COL}; font-size:{F_BASE}; font-weight:bold; border:none;")
+        lay.addWidget(lbl)
+        lay.addWidget(val)
+        return frame, lbl, val
+
+    def set_region(self, y_lo: int, y_hi: int):
+        self._ylo_spin.blockSignals(True)
+        self._yhi_spin.blockSignals(True)
+        self._ylo_spin.setValue(y_lo)
+        self._yhi_spin.setValue(y_hi)
+        self._ylo_spin.blockSignals(False)
+        self._yhi_spin.blockSignals(False)
+        self._image_canvas.set_region(y_lo, y_hi)
+
+    def _on_canvas_region_changed(self, y_lo: int, y_hi: int):
+        self._ylo_spin.blockSignals(True)
+        self._yhi_spin.blockSignals(True)
+        self._ylo_spin.setValue(y_lo)
+        self._yhi_spin.setValue(y_hi)
+        self._ylo_spin.blockSignals(False)
+        self._yhi_spin.blockSignals(False)
+
+    def _on_region_spin_changed(self):
+        y_lo = self._ylo_spin.value()
+        y_hi = self._yhi_spin.value()
+        self._image_canvas.set_region(y_lo, y_hi)
+        if self._data is not None:
+            self._refresh_spectrum()
+
+    def _on_mode_changed(self, mode_id: int):
+        self._lamp_panel.setVisible(mode_id == 0)
+        self._balmer_panel.setVisible(mode_id == 1)
+        self._spec_canvas.enable_span_selector(mode_id == 1)
+
+    def _on_lamp_changed(self):
+        lamp_key = self._lamp_combo.currentData()
+        if lamp_key:
+            warn = LAMP_LINES.get(lamp_key, {}).get("warn")
+            self._warn_label.setText(warn or "")
+
+    def _on_load_file(self):
+        path, _ = QFileDialog.getOpenFileName(
+            self, "Load Calibration Image", "",
+            "FITS files (*.fits *.fit);;All files (*)"
+        )
+        if not path:
+            return
+        try:
+            with pyfits.open(path) as hdul:
+                raw = hdul[0].data
+            if raw is None:
+                self._warn_label.setText("No image data in FITS file.")
+                return
+            self._data = raw.astype(np.float32)
+            self._cal_path = Path(path)
+            self._file_lbl.setText(Path(path).name)
+            self._image_canvas.load(self._data)
+            slant = detect_slant(self._data,
+                                  self._ylo_spin.value(), self._yhi_spin.value())
+            self._last_slant = slant
+            self._slant_val_label.setText(f"{slant:+.2f}°")
+            self._image_canvas._slant_deg = slant
+            self._image_canvas.refresh()
+            self._refresh_spectrum()
+            self._solve_btn.setEnabled(True)
+            self._warn_label.setText("")
+            self._on_lamp_changed()
+        except Exception as e:
+            self._warn_label.setText(f"Error loading file: {e}")
+
+    def _refresh_spectrum(self):
+        if self._data is None:
+            return
+        y_lo = self._ylo_spin.value()
+        y_hi = self._yhi_spin.value()
+        slant = self._last_slant if self._slant_apply_chk.isChecked() else 0.0
+        self._spectrum = extract_cal_spectrum(self._data, y_lo, y_hi, slant_deg=slant)
+        self._spec_canvas.refresh(self._spectrum)
+
+    def _on_solve(self):
+        if self._data is None:
+            return
+        lamp_key = self._lamp_combo.currentData()
+        y_lo = self._ylo_spin.value()
+        y_hi = self._yhi_spin.value()
+
+        slant = detect_slant(self._data, y_lo, y_hi)
+        self._last_slant = slant
+        self._slant_val_label.setText(f"{slant:+.2f}°")
+        self._image_canvas._slant_deg = slant
+        self._image_canvas.refresh()
+
+        spectrum = extract_cal_spectrum(
+            self._data, y_lo, y_hi,
+            slant_deg=slant if self._slant_apply_chk.isChecked() else 0.0,
+        )
+        self._spectrum = spectrum
+        self._spec_canvas.refresh(spectrum)
+
+        result = auto_solve_lamp(spectrum, lamp_key)
+
+        if result is None or result.get("n_matched", 0) < 4:
+            peaks = detect_emission_peaks(spectrum)
+            n_found = result.get("n_matched", 0) if result else 0
+            if len(peaks) < 3:
+                msg = "No signal — increase exposure or check lamp type."
+            elif len(peaks) > 80:
+                msg = "Overexposed — too many false peaks. Reduce exposure."
+            else:
+                msg = (f"Poor solution ({n_found} lines matched). "
+                       f"Check lamp type or Y-region.")
+            self._error_label.setText(msg)
+            self._error_panel.setVisible(True)
+            self._result_section.setVisible(False)
+            return
+
+        self._cal = WavelengthCalibration(
+            coef        = result["coef"].tolist(),
+            poly_order  = result["poly_order"],
+            rms_global  = result["rms_global"],
+            rms_blue    = result["rms_blue"],
+            rms_red     = result["rms_red"],
+            n_matched   = result["n_matched"],
+            n_total     = result["n_total"],
+            lambda_min  = result["lambda_min"],
+            lambda_max  = result["lambda_max"],
+            slant_deg   = slant,
+            lamp_type   = lamp_key,
+            source_file = str(self._cal_path),
+            timestamp   = datetime.now().isoformat(timespec='seconds'),
+        )
+        self._matched_pairs = result["matched_pairs"]
+        self._spec_canvas.refresh(spectrum, matched_pairs=self._matched_pairs)
+        self._res_canvas.refresh(self._matched_pairs, result["coef"])
+        self._update_result_widgets()
+        self._save_btn.setEnabled(True)
+        self._error_panel.setVisible(False)
+        self._result_section.setVisible(True)
+
+    def _on_span_selected(self, px_min: float, px_max: float):
+        if self._spectrum is None:
+            return
+        x = np.arange(len(self._spectrum))
+        mask = (x >= px_min) & (x <= px_max)
+        if mask.sum() < 5:
+            return
+        centroid_px = fit_gaussian_absorption(x[mask].astype(float),
+                                               self._spectrum[mask])
+        if centroid_px is None:
+            return
+        self._pending_px = centroid_px
+
+    def _on_assign_balmer(self):
+        if self._pending_px is None:
+            return
+        idx = self._line_combo.currentIndex()
+        name, wave = STELLAR_LINES[idx]
+        self._balmer_pairs.append((self._pending_px, wave, name))
+        self._balmer_list.addItem(
+            f"{name}  {wave:.2f} Å  @ px {self._pending_px:.1f}")
+        self._pending_px = None
+        if len(self._balmer_pairs) >= 2:
+            self._fit_balmer()
+
+    def _on_clear_balmer(self):
+        self._balmer_pairs.clear()
+        self._balmer_list.clear()
+        self._pending_px = None
+        self._result_section.setVisible(False)
+
+    def _fit_balmer(self):
+        px_arr  = np.array([p[0] for p in self._balmer_pairs])
+        wav_arr = np.array([p[1] for p in self._balmer_pairs])
+        coef    = _fit_best_order(px_arr, wav_arr)
+        n       = len(self._balmer_pairs)
+        fitted  = np.polyval(coef, px_arr)
+        resid   = wav_arr - fitted
+        rms_note = ""
+        if n <= len(coef):
+            rms_note   = f"exact fit ({n} tie points — RMS meaningless)"
+            rms_global = 0.0
+        else:
+            rms_global = float(np.sqrt(np.mean(resid ** 2)))
+        blue_mask = wav_arr < 5500
+        red_mask  = ~blue_mask
+        rms_blue = float(np.sqrt(np.mean(resid[blue_mask] ** 2))) if blue_mask.any() else float('nan')
+        rms_red  = float(np.sqrt(np.mean(resid[red_mask]  ** 2))) if red_mask.any()  else float('nan')
+        self._cal = WavelengthCalibration(
+            coef        = coef.tolist(),
+            poly_order  = len(coef) - 1,
+            rms_global  = rms_global,
+            rms_blue    = rms_blue,
+            rms_red     = rms_red,
+            n_matched   = n,
+            n_total     = n,
+            lambda_min  = float(wav_arr.min()),
+            lambda_max  = float(wav_arr.max()),
+            slant_deg   = self._last_slant,
+            lamp_type   = "Balmer",
+            source_file = str(self._cal_path) if self._cal_path else "",
+            timestamp   = datetime.now().isoformat(timespec='seconds'),
+        )
+        self._matched_pairs = [(px_arr[i], wav_arr[i], self._balmer_pairs[i][2])
+                               for i in range(n)]
+        self._res_canvas.refresh(self._matched_pairs, coef)
+        self._update_result_widgets()
+        if rms_note:
+            self._rms_caveat_label.setText(rms_note)
+        self._save_btn.setEnabled(True)
+        self._error_panel.setVisible(False)
+        self._result_section.setVisible(True)
+
+    def _update_result_widgets(self):
+        if self._cal is None:
+            return
+        rms = self._cal.rms_global
+        rms_col = OK_COL if rms < 0.8 else WARN
+        self._card_rms_global[2].setText(f"{rms:.3f} Å")
+        self._card_rms_global[2].setStyleSheet(
+            f"color:{rms_col}; font-size:{F_BASE}; font-weight:bold; border:none;")
+        self._card_matched[2].setText(
+            f"{self._cal.n_matched}/{self._cal.n_total}")
+        # Blue RMS
+        if np.isnan(self._cal.rms_blue):
+            self._card_rms_blue[0].setStyleSheet(
+                f"QFrame {{ background:{DARK_BORDER}; border:1px solid {DARK_BORDER};"
+                f" border-radius:3px; }}")
+            self._card_rms_blue[2].setText("N/A")
+            self._card_rms_blue[2].setStyleSheet(
+                f"color:{WARN}; font-size:{F_BASE}; font-weight:bold; border:none;")
+        else:
+            col = OK_COL if self._cal.rms_blue < 0.8 else WARN
+            self._card_rms_blue[2].setText(f"{self._cal.rms_blue:.3f} Å")
+            self._card_rms_blue[2].setStyleSheet(
+                f"color:{col}; font-size:{F_BASE}; font-weight:bold; border:none;")
+        # Red RMS
+        if np.isnan(self._cal.rms_red):
+            self._card_rms_red[0].setStyleSheet(
+                f"QFrame {{ background:{DARK_BORDER}; border:1px solid {DARK_BORDER};"
+                f" border-radius:3px; }}")
+            self._card_rms_red[2].setText("N/A")
+            self._card_rms_red[2].setStyleSheet(
+                f"color:{WARN}; font-size:{F_BASE}; font-weight:bold; border:none;")
+        else:
+            col = OK_COL if self._cal.rms_red < 0.8 else WARN
+            self._card_rms_red[2].setText(f"{self._cal.rms_red:.3f} Å")
+            self._card_rms_red[2].setStyleSheet(
+                f"color:{col}; font-size:{F_BASE}; font-weight:bold; border:none;")
+        self._coverage_bar.set_range(self._cal.lambda_min, self._cal.lambda_max)
+        self._poly_order_label.setText(
+            f"Polynomial order: {self._cal.poly_order}")
+        self._rms_caveat_label.setText("RMS reflects centroiding accuracy")
+
+    def _on_save(self):
+        if self._cal is None:
+            return
+        cal_path = Path(__file__).parent / "wavelength_cal.json"
+        try:
+            with open(cal_path, "w") as f:
+                json.dump(self._cal.to_dict(), f, indent=2)
+            self._warn_label.setText("Saved ✓")
+        except Exception as e:
+            self._warn_label.setText(f"Save error: {e}")
+
+
 # ── Main window ────────────────────────────────────────────────────────────────
 class MainWindow(QMainWindow):
     def __init__(self):
@@ -3017,27 +4203,32 @@ class MainWindow(QMainWindow):
 
         spec_grp, spec_lay = section_box("Extracted Spectrum", "spectrum")
         self.spec_canvas = SpectrumCanvas()
+        self.spec_canvas.zoom_x_changed.connect(self._on_spec_zoom_x_changed)
         spec_lay.addWidget(self.spec_canvas)
 
-        opt_row = QWidget()
-        ol = QHBoxLayout(opt_row)
-        ol.setContentsMargins(0, 0, 0, 0)
-        ol.setSpacing(8)
-        self.chk_norm = QCheckBox("Normalize to peak")
-        snr_row = QWidget()
-        snr_rl = QHBoxLayout(snr_row)
-        snr_rl.setContentsMargins(0, 0, 0, 0)
-        snr_rl.setSpacing(2)
-        self.chk_snr = QCheckBox("Show SNR curve")
-        snr_rl.addWidget(self.chk_snr)
-        self._snr_help_btn = HelpButton(HELP["snr"])
-        snr_rl.addWidget(self._snr_help_btn)
-        self.chk_norm.toggled.connect(self._on_options)
-        self.chk_snr.toggled.connect(self._on_options)
-        ol.addWidget(self.chk_norm)
-        ol.addWidget(snr_row)
-        ol.addStretch()
-        spec_lay.addWidget(opt_row)
+        spec_zoom_row = QWidget()
+        szl = QHBoxLayout(spec_zoom_row)
+        szl.setContentsMargins(0, 0, 0, 0)
+        szl.setSpacing(4)
+        self.btn_spec_zoom = QPushButton("⊕ Zoom")
+        self.btn_spec_zoom.setCheckable(True)
+        self.btn_spec_zoom.setFixedWidth(78)
+        self.btn_spec_zoom.setToolTip("Click and drag a rectangle on the spectrum to zoom in")
+        self.btn_spec_zoom.toggled.connect(self._on_spec_zoom_toggle)
+        self.btn_spec_reset_zoom = QPushButton("↺ Reset")
+        self.btn_spec_reset_zoom.setFixedWidth(78)
+        self.btn_spec_reset_zoom.setToolTip("Restore full spectrum and image view")
+        self.btn_spec_reset_zoom.clicked.connect(self._on_spec_zoom_reset)
+        self.btn_spec_zoom_range = QPushButton("Zoom to range")
+        self.btn_spec_zoom_range.setToolTip(
+            "Zoom Y so the target peak is at 80% of the visible scale")
+        self.btn_spec_zoom_range.clicked.connect(self._on_spec_zoom_to_range)
+        szl.addWidget(self.btn_spec_zoom)
+        szl.addWidget(self.btn_spec_reset_zoom)
+        szl.addWidget(self.btn_spec_zoom_range)
+        szl.addStretch()
+        spec_lay.addWidget(spec_zoom_row)
+
         st_lay.addWidget(spec_grp, stretch=1)
 
         self.advisory = AdvisoryPanel()
@@ -3135,8 +4326,6 @@ class MainWindow(QMainWindow):
         self.ctrl_bg_below.set_values(
             self.cfg["bg_below_y_start"], self.cfg["bg_below_y_end"])
         self.stretch_slider.setValue(self.cfg.get("stretch_value", 3))
-        self.chk_norm.setChecked(self.cfg.get("normalize_spectrum", False))
-        self.chk_snr.setChecked(self.cfg.get("show_snr", True))
         if self.cfg.get("watch_folder"):
             self.lbl_folder.setText(self.cfg["watch_folder"])
         self.txt_filter.setText(self.cfg.get("file_filter", ""))
@@ -3150,8 +4339,6 @@ class MainWindow(QMainWindow):
         self.cfg["bg_below_y_start"], self.cfg["bg_below_y_end"] = \
             self.ctrl_bg_below.get_values()
         self.cfg["stretch_value"]      = self.stretch_slider.value()
-        self.cfg["normalize_spectrum"] = self.chk_norm.isChecked()
-        self.cfg["show_snr"]           = self.chk_snr.isChecked()
         self.cfg["gain_advice_on"]     = self._gain_on
 
     def _spinboxes_from_canvas(self):
@@ -3163,8 +4350,6 @@ class MainWindow(QMainWindow):
     def _cfg_from_canvas(self):
         self.img_canvas.region_to_cfg(self.cfg)
         self.cfg["stretch_value"]      = self.stretch_slider.value()
-        self.cfg["normalize_spectrum"] = self.chk_norm.isChecked()
-        self.cfg["show_snr"]           = self.chk_snr.isChecked()
 
     def _fmt_count(self) -> str:
         """Return 'N/T file(s)' where N=filtered count, T=total FITS in folder."""
@@ -3392,8 +4577,7 @@ class MainWindow(QMainWindow):
 
     def _refresh_spec_advisory(self):
         res = self.spec_canvas.refresh(
-            self._effective_fits(), self.cfg,
-            self.chk_snr.isChecked(), self.chk_norm.isChecked())
+            self._effective_fits(), self.cfg)
         if res is not None:
             _, self._spec, self._bg, self._n_target = res
         self.advisory.refresh_data(
@@ -3456,9 +4640,27 @@ class MainWindow(QMainWindow):
     def _on_zoom_reset(self):
         self.btn_zoom.setChecked(False)
         self.img_canvas.reset_zoom()
+        self.spec_canvas.reset_zoom()
+        self.session_monitor.conv_panel.reset_xrange()
+
+    def _on_spec_zoom_toggle(self, checked):
+        self.spec_canvas.set_zoom_mode(checked)
+
+    def _on_spec_zoom_reset(self):
+        self.btn_spec_zoom.setChecked(False)
+        self.spec_canvas.reset_zoom()
+        self.img_canvas.reset_zoom()
+        self.session_monitor.conv_panel.reset_xrange()
+
+    def _on_spec_zoom_to_range(self):
+        self.spec_canvas.zoom_to_data_range()
 
     def _on_zoom_x_changed(self, x_min: float, x_max: float):
-        self.spec_canvas.set_xrange(x_min, x_max, self._spec)
+        self.spec_canvas.set_xrange(x_min, x_max)
+        self.session_monitor.conv_panel.set_xrange(x_min, x_max)
+
+    def _on_spec_zoom_x_changed(self, x_min: float, x_max: float):
+        self.img_canvas.set_xrange(x_min, x_max)
         self.session_monitor.conv_panel.set_xrange(x_min, x_max)
 
     def _on_zoom_reset_sync(self):
@@ -3595,8 +4797,6 @@ class MainWindow(QMainWindow):
         for hbtn in _section_help_buttons:
             hbtn.setStyleSheet(
                 "" if day else f"color:{TEXT_HI}; font-size:12pt; border:none;")
-        self._snr_help_btn.setStyleSheet(
-            "" if day else f"color:{TEXT_HI}; font-size:12pt; border:none;")
         for grp in _section_boxes:
             grp.setStyleSheet(
                 "" if day else

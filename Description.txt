@@ -44,8 +44,10 @@ QUICK START
 6. Click "Gain Advice: OFF" in the Exposure Advisory header to enable a full
    ASI585MM Pro gain analysis (HCG mode, read noise, full well, gain recommendation).
 
-7. Use "⊕ Zoom" to rubber-band zoom on the 2D image; the spectrum x-axis
-   synchronises automatically. Click "↺ Reset" to return to the full frame.
+7. Use "⊕ Zoom" above the image or below the spectrum chart to rubber-band zoom;
+   both canvases synchronise on the X-axis. "Zoom to range" (below the spectrum)
+   scales the Y-axis so the spectrum peak sits at 80 % of the visible height.
+   Click "↺ Reset" to restore the full view. Zoom settings persist across file loads.
 
 8. Hold/Latest radio buttons (in the image section header) control whether the
    display updates when new frames arrive. The image title shows "HOLD FITS Image"
@@ -59,12 +61,16 @@ QUICK START
 
 SPECTRUM VIEW
 -------------
-- Y-axis spans the full sensor dynamic range (full_range × n_target_rows) so you can
-  judge how much headroom remains at a glance.
-- The dashed Sat. limit line marks where any column sum would indicate saturation.
-  Column shading is consistent with this line (shading appears when the raw column
-  sum exceeds the saturation threshold, not when a single pixel crosses it).
-- Optional normalised view (peak = 1.0) and SNR curve overlay.
+- White line: hot-pixel-filtered peak ADU per wavelength column (2nd-highest pixel
+  across all TARGET rows — removes single hot pixels without clipping real signal).
+- Amber line: sky background level per column from the BG regions (sigma-clipped mean).
+- Dashed red line: linearity limit at 80 % of the full ADU range (52 428 for 16-bit).
+  Columns with peak pixels above this line are shaded red.
+- Y-axis spans the full sensor ADU range (0–65 535 for 16-bit), fixed, so you can
+  judge available headroom at a glance regardless of target brightness.
+- Zoom buttons below the chart: ⊕ Zoom (rubber-band both axes), "Zoom to range"
+  (Y scale so spectrum peak sits at 80 % of visible range), ↺ Reset. Zoom settings
+  persist across file loads.
 
 
 SESSION MONITOR TAB
@@ -182,7 +188,7 @@ Key config fields:
 
 FILES
 -----
-  spectro_tool.py            — main application (single file, ~3 800 lines)
+  spectro_tool.py            — main application (single file, ~4 950 lines)
   spectro_config.json        — auto-generated settings file (created on first run)
   logbook_<Target>.txt       — per-target session logbook (created in watch folder)
   nominated\                 — sub-folder created by Frame Manager export

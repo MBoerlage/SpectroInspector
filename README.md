@@ -21,10 +21,11 @@ The app continuously watches your FITS science image folder for new exposures �
 - **Gain Advice** (toggle) — full ASI585MM Pro analysis: HCG mode detection, read noise, full-well, and gain change recommendation
 
 ### Spectrum View
-- Extracted bg-subtracted spectrum and raw column sum plotted together
-- Y-axis spans the full sensor dynamic range (`full_range × n_target_rows`) so you can judge how much headroom remains
-- Saturation shading on the spectrum is consistent with the drawn saturation threshold line
-- Optional normalised view and SNR overlay curve
+- **White line** — hot-pixel-filtered peak ADU per column: 2nd-highest pixel value across TARGET rows, so a single hot pixel cannot distort the reading
+- **Amber line** — sky background level per column from the BG regions (sigma-clipped mean)
+- **Dashed red line + red shading** — linearity limit at 80 % of the full ADU range; shaded columns exceed it
+- Y-axis fixed 0 → full sensor range (65 535 for 16-bit) — available headroom is visible at a glance
+- **Zoom to range** button sets the Y scale so the spectrum peak sits at 80 % of visible height; zoom settings persist across file loads
 
 ### Slit Quality Metrics (Session Monitor)
 Replaces the former FWHM-only chart with a four-metric panel, all on a shared **% deviation from session baseline** y-axis. Toggle each metric independently:
@@ -65,10 +66,8 @@ Reference lines at 0 %, ±10 %, ±30 % are drawn at low opacity. The collapsible
 
 | | |
 |---|---|
-| ![Saturation detection — day mode](screenshots/SaturationDetection.png) | ![Exposure Advisory and Gain Advisory — night mode](screenshots/ExposureAdvisor.png) |
-| **Saturation detection (day mode)** — A heavily overexposed frame: a wide swath of the 2D image is washed out, and the extracted spectrum plot shows the saturated columns shaded in red. The Exposure Advisory immediately flags the saturation, reports the first saturated column, and calculates a shorter exposure suggestion. The y-axis spans the full sensor dynamic range so you can see at a glance how much headroom remains. | **Exposure Advisory + Gain Advisory (night mode)** — A well-exposed frame in Hold display mode. SNR 128.6, peak fill 76 % — right in the target range. Gain Advice is enabled: the Gain Advisory section confirms the camera is in HCG mode at gain 200, read noise ~1 e⁻, and the gain is already optimal for background-limited observing. The full red-channel-only night-vision palette is shown. |
 | ![Slit Quality Metrics — day mode](screenshots/SlitQuality.png) | ![Session Monitor and Frame Manager — night mode](screenshots/FrameManager.png) |
-| **Slit Quality Metrics (day mode)** — Session Monitor tab with the Slit Quality panel expanded. Four metrics are plotted on a shared % from baseline y-axis across 8 included frames: Integrated Flux (orange), Spatial Centroid Y (green), Profile Asymmetry (bright orange), and Flux RMS rolling window (red). The header summarises the latest values. Below it, the Signal Convergence chart shows the running mean spectrum with ±1 σ/√N envelope, and the SNR sparkline tracks frame-by-frame growth. The Frame Manager reports 8/11 frames included with 5 auto-flagged. | **Session Monitor + Frame Manager (night mode)** — The full night-vision view of the Session Monitor tab. The Slit Quality header reads Flux 2150 k, Centroid 61.5 px, Asymmetry +42 %, RMS 5.0 %. The Signal Convergence panel shows the accumulated mean spectrum with its confidence envelope. The Frame Manager table lists every frame with Peak ADU, Continuum SNR, FWHM, and Status; flagged frames are highlighted. The ★ Nominate OK button and sortable column headers are visible at the top of the table. |
+| **Slit Quality Metrics (day mode)** — Session Monitor tab with the Slit Quality panel expanded. Four metrics on a shared % from baseline y-axis: Integrated Flux (orange), Spatial Centroid Y, Profile Asymmetry, and Flux RMS rolling window. The Signal Convergence chart below shows the running mean spectrum with ±1 σ/√N envelope and the SNR sparkline. | **Session Monitor + Frame Manager (night mode)** — Full night-vision view of the Session Monitor tab. The Frame Manager table lists every frame with Peak ADU, Continuum SNR, FWHM, and Status; flagged frames are highlighted. The ★ Nominate OK button and sortable column headers are visible at the top. |
 
 
 ## Requirements
@@ -123,7 +122,7 @@ python spectro_tool.py
 
 6. Enable **Gain Advice** (button in the Exposure Advisory header) for a full ASI585MM Pro gain analysis.
 
-7. Use **⊕ Zoom** to draw a rectangle on the image and zoom in; the spectrum X-axis synchronises automatically. Click **↺ Reset** to return to the full frame.
+7. Use **⊕ Zoom** (above the image or below the spectrum chart) to draw a rubber-band rectangle and zoom in; both canvases synchronise on the X-axis. Click **↺ Reset** to return to the full frame. Use **Zoom to range** below the spectrum to scale the Y-axis so the peak sits at 80 % of height.
 
 8. Switch to the **Session Monitor** tab to track multi-frame session quality. Expand the **Slit Quality Metrics** panel to monitor flux, centroid, asymmetry, and RMS stability in real time.
 

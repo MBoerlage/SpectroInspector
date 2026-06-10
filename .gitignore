@@ -5,3 +5,4 @@ __pycache__/
 spectro_config.json
 .venv/
 .claude/
+not_ready/

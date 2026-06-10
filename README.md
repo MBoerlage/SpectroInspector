@@ -4,6 +4,15 @@ Built with major help from Claude, Spectro Inspector is a real-time quality cont
 
 The app continuously watches your FITS science image folder for new exposures — compatible with acquisition software such as SharpCap or N.I.N.A. (requires basic FITS headers only). Your original science frames remain completely untouched and uncalibrated.
 
+## Screenshots
+
+| | |
+|---|---|
+| ![Exposure Advisory — night mode](screenshots/ExposureAdvisory.png) | ![M77 session — day mode](screenshots/ExposureAdvisorym77.png) |
+| **Exposure Advisory (night mode)** — Single-frame view of a stellar spectrum in the red night-vision palette. The Extracted Spectrum panel shows the hot-pixel-filtered peak ADU (white) and sky background (amber) against the 80 % linearity limit. The Exposure Advisory flags high peak fill and reports SNR at the brightest column. Gain Advisory is open, confirming optimal HCG mode settings for the current noise regime. | **M77 galaxy spectrum (day mode)** — 29 accumulated frames of M77 viewed in day mode. The spectrum chart shows the galaxy continuum, and the Exposure Advisory reports the multi-frame SNR and an updated exposure suggestion. The watch folder path and frame counter are visible in the bottom bar. |
+| ![Slit Quality Metrics — day mode](screenshots/SlitQuality.png) | ![Session Monitor and Frame Manager — night mode](screenshots/FrameManager.png) |
+| **Slit Quality Metrics (day mode)** — Session Monitor tab with the Slit Quality panel expanded. Four metrics on a shared % from baseline y-axis: Integrated Flux (orange), Spatial Centroid Y, Profile Asymmetry, and Flux RMS rolling window. The Signal Convergence chart below shows the running mean spectrum with ±1 σ/√N envelope and the SNR sparkline. | **Session Monitor + Frame Manager (night mode)** — Full night-vision view of the Session Monitor tab. The Frame Manager table lists every frame with Peak ADU, Continuum SNR, FWHM, and Status; flagged frames are highlighted. The ★ Nominate OK button and sortable column headers are visible at the top. |
+
 ## Features
 
 ### Acquisition Control
@@ -61,14 +70,6 @@ Reference lines at 0 %, ±10 %, ±30 % are drawn at low opacity. The collapsible
 ### Night / Day Theme
 - **Night mode** — red-channel-only palette for use through a red astronomy filter
 - **Day mode** — standard bright interface; toggle button sits in the image section header
-
-## Screenshots
-
-| | |
-|---|---|
-| ![Slit Quality Metrics — day mode](screenshots/SlitQuality.png) | ![Session Monitor and Frame Manager — night mode](screenshots/FrameManager.png) |
-| **Slit Quality Metrics (day mode)** — Session Monitor tab with the Slit Quality panel expanded. Four metrics on a shared % from baseline y-axis: Integrated Flux (orange), Spatial Centroid Y, Profile Asymmetry, and Flux RMS rolling window. The Signal Convergence chart below shows the running mean spectrum with ±1 σ/√N envelope and the SNR sparkline. | **Session Monitor + Frame Manager (night mode)** — Full night-vision view of the Session Monitor tab. The Frame Manager table lists every frame with Peak ADU, Continuum SNR, FWHM, and Status; flagged frames are highlighted. The ★ Nominate OK button and sortable column headers are visible at the top. |
-
 
 ## Requirements
 

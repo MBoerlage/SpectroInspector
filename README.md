@@ -1,6 +1,8 @@
 # Spectro Inspector
 
-Built with major help from Claude, Spectro Inspector is a real-time quality control and session monitoring tool for astronomical spectroscopy acquisition.
+Spectro Inspector is a real-time quality control and session monitoring tool for astronomical spectroscopy acquisition.
+
+A common challenge is to find the right exposure time/gain for spectroscopic images. Too short will result in poor SNR. Too long will risk non-linearity or even saturation - hence incorrect data.
 
 The app continuously watches your FITS science image folder for new exposures — compatible with acquisition software such as SharpCap or N.I.N.A. (requires basic FITS headers only). Your original science frames remain completely untouched and uncalibrated.
 
